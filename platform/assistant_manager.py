@@ -13,7 +13,8 @@ AM_AGENTS_ROOT defaults to /opt/agents.
 * JSON API                local bind with X-Manager-Token
 
 Pilot ledger: up to 5 rows. Postpone only moves release_at later.
-Delete removes the row, status history, costs, requests, and invite codes.
+A row is released when release_at has passed, or when own server, own line, and own key are all set.
+Release runs the same delete as an explicit delete: the row, status history, costs, requests, and invite codes.
 
 Host invite lines are appended to <agents root>/_shared/invites.txt.
 Signup handling lives outside this tree.
@@ -745,23 +746,19 @@ def set_flags(cid, own_server=None, own_line=None, own_key=None):
         if flag is None:
             return None, "bad flag"
         parsed.append(flag)
-    alert = False
-    label_s = ""
     with _lock:
         led = load_ledger()
         c = _find_client(led, cid)
         if not c:
             return None, "missing"
-        before = _all_own(c)
         for key, val in zip(("own_server", "own_line", "own_key"), parsed):
             if val is not None:
                 c[key] = val
         save_ledger(led)
-        alert = _all_own(c) and not before
-        label_s = c.get("label") or ""
         saved = c
-    if alert:
-        notify(f"{label_s}: יש שרת, קו ומפתח משלו. השחרור מוכן. המחיקה אצלנו רצה רק כשמבקשים אותה.", urgent=True)
+    if is_release_due(saved):
+        enforce_due_releases()
+        return None, "released"
     return saved, None
 
 
@@ -1051,6 +1048,7 @@ def lookup_invite(code):
 
 
 def summary():
+    enforce_due_releases()
     idx = status_index()
     reg = registry()
     reqs = load_reqs()["items"]
@@ -1087,11 +1085,22 @@ def _alert(st, slug, kind, text, sent):
     sent.append(text)
 
 
+def enforce_due_releases():
+    """Delete every pilot row that is due. Same path as an explicit delete."""
+    with _lock:
+        due = [c.get("id") for c in (load_ledger().get("clients") or []) if c.get("id") and is_release_due(c)]
+    released = []
+    for cid in due:
+        if delete_client(cid):
+            released.append(cid)
+    return released
+
+
 def _pilot_alerts(st, sent):
     for c in load_ledger().get("clients") or []:
-        label_s = c.get("label") or ""
         if is_release_due(c):
-            _alert(st, c["id"], "release_due", f"{label_s}: הגיע זמן שחרור. המחיקה אצלנו רצה רק כשמבקשים אותה.", sent)
+            continue
+        label_s = c.get("label") or ""
         spent = _usd(c.get("openai_spend_usd")) or Decimal("0")
         if spent >= CAP_USD:
             _alert(st, c["id"], "cap", f"{label_s}: ההוצאה על OpenAI הגיעה לתקרה של 20 דולר.", sent)
@@ -1152,7 +1161,9 @@ def health_tick():
             st["pending"] = (st.get("pending") or [])[-19:] + [text]
         flush_pending(st)
         save_state(st)
-        return sent
+        result = sent
+    enforce_due_releases()
+    return result
 
 
 def _bot_tick(slug, v, b, s, st, sent, baseline):
@@ -1481,6 +1492,7 @@ class H(BaseHTTPRequestHandler):
         p = self._path()
         if p == "/healthz":
             return self._send(200, {"ok": True})
+        enforce_due_releases()
         if self.kind == "proxy":
             if not self._proxy_ok():
                 return self._send(403, {"ok": False})
@@ -1538,6 +1550,8 @@ class H(BaseHTTPRequestHandler):
             raw = self._body()
         except Exception:
             return self._send(413, {"ok": False})
+        if p != "/healthz":
+            enforce_due_releases()
         if self.kind == "local" and p == "/intake":
             return self._intake(raw)
         if self.kind == "local" and p == "/cost":
@@ -1581,6 +1595,8 @@ class H(BaseHTTPRequestHandler):
                 d["own_line"] if "own_line" in d else None,
                 d["own_key"] if "own_key" in d else None,
             )
+            if err == "released":
+                return self._send(200, {"ok": True, "released": True})
         elif action == "slots":
             c, err = set_slots(cid, d)
         elif action == "spend":
@@ -1682,6 +1698,8 @@ class H(BaseHTTPRequestHandler):
                 None if "own_line" not in f else f["own_line"][-1],
                 None if "own_key" not in f else f["own_key"][-1],
             )
+            if err == "released":
+                return self._send(303, b"", "text/plain", {"location": PREFIX + "/"})
         elif action == "slots":
             payload = {}
             if "line_slot" in f:

@@ -282,28 +282,136 @@ class ManagerTests(unittest.TestCase):
         self.assertIsNone(err)
         _fail_if("תקרה" not in self._outbox(), "quiet hours swallowed the cap alert")
 
-    def test_own_flags_mark_due_without_deleting(self):
-        row, err = am.create_client("pilot-flags")
+    def _tracked_client(self, label, slug):
+        agents = self.root / "agents"
+        shared = agents / "_shared"
+        shared.mkdir(parents=True, exist_ok=True)
+        invite_file = shared / "invites.txt"
+        if not invite_file.exists():
+            invite_file.write_text("KEEPCODE01\n", encoding="utf-8")
+        token = secrets.token_urlsafe(32)
+        home = agents / slug
+        home.mkdir(exist_ok=True)
+        (home / ".manager_token").write_text(token + "\n", encoding="utf-8")
+        (home / ".env").write_text("BOT_NAME=helper\n", encoding="utf-8")
+        created = am.now().strftime("%Y-%m-%d %H:%M:%S")
+        reg_path = agents / "registry.json"
+        reg = {}
+        if reg_path.is_file():
+            reg = json.loads(reg_path.read_text(encoding="utf-8"))
+        reg[slug] = {"user": "agent-" + slug, "created": created}
+        reg["other-bot"] = {"user": "agent-other-bot", "created": created}
+        reg_path.write_text(json.dumps(reg), encoding="utf-8")
+        status_dir = agents / "_status"
+        status_dir.mkdir(exist_ok=True)
+        (status_dir / (slug + ".json")).write_text(json.dumps({"up": False}), encoding="utf-8")
+        index_path = status_dir / "index.json"
+        index = {"checked_at": am.now().isoformat(timespec="seconds"), "bots": {}}
+        if index_path.is_file():
+            index = json.loads(index_path.read_text(encoding="utf-8"))
+        index.setdefault("bots", {})[slug] = {"up": False}
+        index["bots"]["other-bot"] = {"up": True}
+        index["checked_at"] = am.now().isoformat(timespec="seconds")
+        index_path.write_text(json.dumps(index), encoding="utf-8")
+        row, err = am.create_client(label, slug)
         self.assertIsNone(err)
-        saved, err = am.set_flags(row["id"], True, False, False)
+        _saved, err = am.set_slots(row["id"], {"line_slot": "line-slot-unique", "key_slot": "key-slot-unique"})
         self.assertIsNone(err)
-        self.assertFalse(am.is_release_due(saved))
-        saved, err = am.set_flags(row["id"], own_line=True, own_key=True)
+        _saved, err = am.add_spend(row["id"], "1.4100", "operator")
         self.assertIsNone(err)
-        self.assertTrue(am.is_release_due(saved))
-        self.assertEqual(saved["line_slot"], "")
-        self.assertEqual(saved["key_slot"], "")
-        self.assertIsNotNone(am.get_client(row["id"]))
+        _saved, err = am.record_status(row["id"], {"up": False, "note": "status-note-unique"})
+        self.assertIsNone(err)
+        kept, err = am.add_request("other-bot", "keep-this-request")
+        self.assertIsNone(err)
+        self.assertIsNotNone(kept)
+        return {
+            "id": row["id"], "code": row["invite_code"], "label": label, "slug": slug,
+            "token": token, "home": home, "status_dir": status_dir,
+        }
 
-    def test_past_release_marks_due_without_deleting(self):
-        os.environ["AM_NOW"] = "2026-01-01T00:00:00"
-        row, err = am.create_client("pilot-clock")
+    def _assert_released(self, spec):
+        markers = [spec["label"], spec["code"], "line-slot-unique", "key-slot-unique", "status-note-unique", "1.4100", "remove-this-request"]
+        self.assertIsNone(am.get_client(spec["id"]))
+        port = self._start("local")
+        proxy = self._start("proxy")
+        checks = [
+            ("GET", "/api/summary", None, 200),
+            ("GET", "/api/clients", None, 200),
+            ("GET", "/api/clients/%s" % spec["id"], None, 404),
+            ("GET", "/api/requests", None, 200),
+            ("GET", "/api/costs", None, 200),
+            ("GET", "/api/costs/%s" % spec["id"], None, 404),
+            ("GET", "/api/status/%s" % spec["id"], None, 404),
+            ("GET", "/api/invites", None, 200),
+            ("GET", "/api/invites/%s" % spec["code"], None, 404),
+        ]
+        for method, path, payload, expect in checks:
+            status, body = self._api(port, method, path, payload, token=am.API_TOKEN)
+            self.assertEqual(status, expect, path)
+            blob = json.dumps(body, ensure_ascii=False)
+            for marker in markers:
+                _fail_if(marker in blob, "endpoint returned released client data")
+        status, page = self._page(proxy, "/manage/")
+        self.assertEqual(status, 200)
+        for marker in markers:
+            _fail_if(marker in page, "page returned released client data")
+            self._gone(marker, "released data")
+        requests = json.loads((self.root / "data" / "requests.json").read_text(encoding="utf-8"))
+        self.assertIn("keep-this-request", [item["text"] for item in requests["items"]])
+        self.assertNotIn("remove-this-request", [item["text"] for item in requests["items"]])
+        lines = ((self.root / "agents" / "_shared" / "invites.txt").read_text(encoding="utf-8")).split()
+        self.assertIn("KEEPCODE01", lines)
+        self.assertNotIn(spec["code"], lines)
+        self.assertFalse((spec["home"] / ".manager_token").exists())
+        self.assertTrue(spec["home"].is_dir())
+        reg = json.loads((self.root / "agents" / "registry.json").read_text(encoding="utf-8"))
+        self.assertNotIn(spec["slug"], reg)
+        self.assertIn("other-bot", reg)
+        self.assertFalse((spec["status_dir"] / (spec["slug"] + ".json")).exists())
+
+    def test_own_flags_release_without_a_separate_delete(self):
+        spec = self._tracked_client("pilot-release-flags", "pilot-rel")
+        stay, err = am.create_client("pilot-stay")
         self.assertIsNone(err)
+        port = self._start("local")
+        status, body = self._api(
+            port, "POST", "/intake",
+            {"slug": spec["slug"], "summary": "remove-this-request"}, token=spec["token"],
+        )
+        self.assertEqual(status, 200)
+        status, body = self._api(
+            port, "POST", "/api/clients/%s/flags" % spec["id"],
+            {"own_server": True, "own_line": True}, token=am.API_TOKEN,
+        )
+        self.assertEqual(status, 200)
+        self.assertFalse(body["client"]["release_due"])
+        self.assertIsNotNone(am.get_client(spec["id"]))
+        status, body = self._api(
+            port, "POST", "/api/clients/%s/flags" % spec["id"],
+            {"own_key": True}, token=am.API_TOKEN,
+        )
+        self.assertEqual(status, 200)
+        self.assertEqual(body, {"ok": True, "released": True})
+        for marker in (spec["label"], spec["code"], "key-slot-unique"):
+            _fail_if(marker in json.dumps(body), "flag response returned the client")
+        self._assert_released(spec)
+        self.assertIsNotNone(am.get_client(stay["id"]))
+        self.assertIn(stay["label"], [c["label"] for c in am.load_ledger()["clients"]])
+
+    def test_past_release_deletes_without_a_separate_delete(self):
+        os.environ["AM_NOW"] = "2026-01-01T00:00:00"
+        spec = self._tracked_client("pilot-release-clock", "pilot-clk")
+        port = self._start("local")
+        status, _body = self._api(
+            port, "POST", "/intake",
+            {"slug": spec["slug"], "summary": "remove-this-request"}, token=spec["token"],
+        )
+        self.assertEqual(status, 200)
+        self.assertIsNotNone(am.get_client(spec["id"]))
         os.environ["AM_NOW"] = "2026-02-01T00:00:00"
-        current = am.get_client(row["id"])
-        self.assertIsNotNone(current)
-        self.assertTrue(am.is_release_due(current))
-        self.assertEqual(len(am.load_ledger()["clients"]), 1)
+        self.assertIsNotNone(am.get_client(spec["id"]))
+        am.health_tick()
+        self._assert_released(spec)
 
     def test_invite_store_failure_keeps_the_ledger_empty(self):
         agents = self.root / "agents"
@@ -359,12 +467,13 @@ class ManagerTests(unittest.TestCase):
         self.assertGreater(am.get_client("c1")["release_at"], row["release_at"])
         status, _page = self._form(
             port, "/manage/clients/c1/flags",
-            {"csrf": csrf, "own_server": "1", "own_line": "1", "own_key": "1"},
+            {"csrf": csrf, "own_server": "1", "own_line": "0", "own_key": "0"},
         )
         self.assertEqual(status, 303)
         flagged = am.get_client("c1")
-        self.assertTrue(am.is_release_due(flagged))
-        self.assertIsNotNone(am.get_client("c1"))
+        self.assertIsNotNone(flagged)
+        self.assertTrue(flagged["own_server"])
+        self.assertFalse(am.is_release_due(flagged))
         status, _page = self._form(
             port, "/manage/clients/c1/slots",
             {"csrf": csrf, "line_slot": "line-slot-unique", "key_slot": "key-slot-unique"},
