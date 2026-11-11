@@ -1,0 +1,6 @@
+[Unit]
+Description=Assistant bot %i - release operator access
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/agentsctl release-access %i
