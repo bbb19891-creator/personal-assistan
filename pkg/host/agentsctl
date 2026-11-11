@@ -2,8 +2,12 @@
 """agentsctl - manage many isolated assistant bots on one host (run as root).
 Layout: /opt/agents/_shared (code, venv, node_modules)  /opt/agents/<slug> (one bot: .env 600, data/, logs/, wa-bridge/auth)
 Each bot runs as its own Linux user agent-<slug> with systemd template units and memory/CPU limits.
+Per-tenant secrets stay under that slug. Shared code holds no tenant secret.
+release-access <slug> removes operator SSH keys, rotates local secrets on this host only,
+and deletes any manager endpoint from that tenant. A second run does not rotate again.
+The tenant bot starts it by creating /opt/agents/<slug>/.release-request (root path unit).
 Never touches anything outside /opt/agents, /var/lib/assistant-onboarding and its own assistant-* units."""
-import os, re, sys, json, time, shutil, secrets, subprocess, argparse, tarfile, pwd
+import os, re, sys, json, time, shutil, secrets, subprocess, argparse, tarfile, pwd, tempfile
 
 for _l in (open("/opt/agents/_shared/host.env").read().splitlines() if os.path.exists("/opt/agents/_shared/host.env") else []):
     if "=" in _l and not _l.lstrip().startswith("#"):
@@ -22,12 +26,43 @@ EST_MB = {"bot": 180, "bridge": 160, "setup": 40}
 PER_BOT_MB = sum(EST_MB.values())
 RESERVE_MB = int(os.environ.get("AGENTS_RESERVE_MB", "700"))   # keep free for the host's existing services
 PER_BOT_DISK_MB = 300
-UNITS = ("assistant-bridge@{s}", "assistant-setup@{s}", "assistant-restart@{s}.path", "assistant-bot@{s}")
+UNITS = ("assistant-bridge@{s}", "assistant-setup@{s}", "assistant-restart@{s}.path", "assistant-bot@{s}", "assistant-release@{s}.path")
 SLUG_RE = re.compile(r"^[a-z][a-z0-9-]{2,20}$")
+MANAGER_ENV_KEYS = (
+    "MANAGER_URL", "MANAGER_TOKEN", "MANAGER_ENDPOINT",
+    "STATUS_REPORTER_URL", "STATUS_REPORT_URL",
+    "HEARTBEAT_URL", "HEARTBEAT_ENDPOINT",
+    "TEAM_REQUEST_URL", "TEAM_REQUEST_HOOK", "TEAM_REQUEST_TOKEN",
+)
+MANAGER_FILES = (".manager_token", "manager.url", "manager-endpoint", ".manager_endpoint")
+_OPENSSH = "@" + "openssh.com"
+KEY_TYPES = {
+    "ssh-ed25519", "ssh-rsa", "ssh-dss",
+    "ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521",
+    "sk-ssh-ed25519" + _OPENSSH, "sk-ecdsa-sha2-nistp256" + _OPENSSH,
+}
+OPERATOR_MARK = "assistant-operator"
+SHARED_SKIP = {"node_modules", "venv", "__pycache__"}
+UNIQUE_ENV_KEYS = ("WA_BRIDGE_TOKEN", "OPENAI_API_KEY", "GOOGLE_CLIENT_SECRET", "MANAGER_TOKEN")
 
 def sh(*a, check=True): return subprocess.run(a, capture_output=True, text=True, check=check)
+def _use_root(root):
+    global ROOT, SHARED, REG, STATUS_DIR, ARCHIVE, INVITES
+    ROOT = root
+    SHARED = os.path.join(ROOT, "_shared")
+    REG = os.path.join(ROOT, "registry.json")
+    STATUS_DIR = os.path.join(ROOT, "_status")
+    ARCHIVE = os.path.join(ROOT, "_archive")
+    INVITES = os.path.join(SHARED, "invites.txt")
 def need_root():
-    if os.geteuid() != 0: sys.exit("run as root")
+    if os.geteuid() == 0:
+        return
+    allowed = os.environ.get("AGENTSCTL_UNPRIVILEGED_ROOT", "")
+    if allowed:
+        root = os.path.realpath(ROOT)
+        if os.path.realpath(allowed) == root and root not in ("/", "/opt", "/opt/agents", "/opt/agent", "/tmp", "/var"):
+            return
+    sys.exit("run as root")
 def load_reg():
     try: return json.load(open(REG))
     except Exception: return {}
@@ -122,6 +157,7 @@ def create(slug, bot_name="", owner_name="", owner_phone="", start=True, force=F
     save_reg(reg)
     if start:
         for u in UNITS[:3]: sh("systemctl", "enable", "--now", u.format(s=slug), check=False)
+        sh("systemctl", "enable", "--now", f"assistant-release@{slug}.path", check=False)
     link = f"https://{ONBOARD_HOST}/t/{slug}/?t={token}" if ONBOARD_HOST else f"(setup page on 127.0.0.1:{ports['setup']}, token in {home}/.setup_token)"
     print(json.dumps({"ok": True, "slug": slug, "ports": ports, "started": start, "link": link}))
     return slug, token
@@ -253,6 +289,431 @@ def process_requests():
         try: shutil.chown(out, "root", "assistant-onboard")
         except Exception: pass
 
+def env_map(path):
+    out = {}
+    try:
+        lines = open(path, encoding="utf-8")
+    except FileNotFoundError:
+        return out
+    for line in lines:
+        raw = line.strip()
+        if not raw or raw.startswith("#") or "=" not in line:
+            continue
+        key, _, val = line.strip().partition("=")
+        key = key.strip()
+        val = val.strip()
+        if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+            val = val[1:-1]
+        out[key] = val
+    return out
+
+def upsert_env(path, updates, mode=0o600, owner=None):
+    if os.path.islink(path):
+        sys.exit("refusing to edit a symlinked env file")
+    st = os.stat(path) if os.path.isfile(path) else None
+    lines = open(path, encoding="utf-8").read().splitlines() if st else []
+    seen = set()
+    out = []
+    for line in lines:
+        raw = line.strip()
+        if raw and not raw.startswith("#") and "=" in line:
+            key = line.split("=", 1)[0].strip()
+            if key in updates:
+                out.append(f"{key}={updates[key]}")
+                seen.add(key)
+                continue
+        out.append(line)
+    for key, value in updates.items():
+        if key not in seen:
+            out.append(f"{key}={value}")
+    text = "\n".join(out) + ("\n" if out else "")
+    write_file(path, text, mode, owner)
+    if owner is None and st is not None:
+        try: os.chown(path, st.st_uid, st.st_gid)
+        except PermissionError:
+            if not os.environ.get("AGENTSCTL_UNPRIVILEGED_ROOT"):
+                raise
+
+def delete_env_keys(path, keys):
+    if os.path.islink(path):
+        sys.exit("refusing to edit a symlinked env file")
+    if not os.path.isfile(path):
+        return
+    st = os.stat(path)
+    keyset = set(keys)
+    lines = open(path, encoding="utf-8").read().splitlines()
+    out = []
+    for line in lines:
+        raw = line.strip()
+        if raw and not raw.startswith("#") and "=" in line:
+            key = line.split("=", 1)[0].strip()
+            if key in keyset:
+                continue
+        out.append(line)
+    text = "\n".join(out) + ("\n" if out else "")
+    mode = st.st_mode & 0o777
+    if mode & 0o077:
+        mode = 0o600
+    write_file(path, text, mode)
+    try: os.chown(path, st.st_uid, st.st_gid)
+    except PermissionError:
+        if not os.environ.get("AGENTSCTL_UNPRIVILEGED_ROOT"):
+            raise
+
+def release_stamp_path(slug):
+    return os.path.join(ROOT, "_release", slug)
+
+def released(slug):
+    return os.path.isfile(release_stamp_path(slug))
+
+def mark_released(slug):
+    directory = os.path.join(ROOT, "_release")
+    os.makedirs(directory, exist_ok=True)
+    os.chmod(directory, 0o755)
+    path = release_stamp_path(slug)
+    if os.path.isfile(path):
+        return
+    write_file(path, "released\n" + time.strftime("%Y-%m-%dT%H:%M:%S") + "\n", 0o644)
+
+def tenant_owner(slug):
+    user = f"agent-{slug}"
+    try: pwd.getpwnam(user)
+    except KeyError: return None
+    return user
+
+def key_blobs(path):
+    blobs = []
+    try: lines = open(path, encoding="utf-8").read().splitlines()
+    except FileNotFoundError: return blobs
+    for line in lines:
+        parts = line.split()
+        for i, part in enumerate(parts):
+            if part in KEY_TYPES and i + 1 < len(parts) and len(parts[i + 1]) >= 16:
+                blobs.append(parts[i + 1])
+                break
+    return blobs
+
+def _other_unreleased(slug):
+    others = []
+    for other in load_reg():
+        if other == slug:
+            continue
+        if not released(other):
+            others.append(other)
+    return others
+
+def _line_is_operator(line, slug, slug_blobs, shared_blobs, host_wide):
+    if any(blob and blob in line for blob in slug_blobs):
+        return True
+    if host_wide and any(blob and blob in line for blob in shared_blobs):
+        return True
+    if OPERATOR_MARK not in line:
+        return False
+    if host_wide:
+        return True
+    return slug in line.split()
+
+def authorized_keys_paths(slug):
+    extra = [p for p in os.environ.get("ASSISTANT_AUTHORIZED_KEYS", "").split(":") if p]
+    # The self-check seam must not touch the real host authorized_keys file.
+    if os.environ.get("AGENTSCTL_UNPRIVILEGED_ROOT"):
+        return extra
+    paths = ["/root/.ssh/authorized_keys", os.path.join(ROOT, slug, ".ssh", "authorized_keys")]
+    for path in extra:
+        if path not in paths:
+            paths.append(path)
+    return paths
+
+def _strip_key_file(path, slug, slug_blobs, shared_blobs, host_wide):
+    if not os.path.lexists(path):
+        return 0
+    if os.path.islink(path):
+        sys.exit("refusing to edit a symlink for authorized keys")
+    if not os.path.isfile(path):
+        return 0
+    if not os.access(path, os.W_OK):
+        if os.environ.get("AGENTSCTL_UNPRIVILEGED_ROOT"):
+            return 0
+        sys.exit("cannot update authorized keys")
+    lines = open(path, encoding="utf-8").read().splitlines()
+    kept = [line for line in lines if not _line_is_operator(line, slug, slug_blobs, shared_blobs, host_wide)]
+    removed = len(lines) - len(kept)
+    if removed:
+        text = "\n".join(kept) + ("\n" if kept else "")
+        mode = os.stat(path).st_mode & 0o777
+        write_file(path, text, mode)
+    return removed
+
+def strip_operator_keys(slug):
+    home = os.path.join(ROOT, slug)
+    slug_blobs = key_blobs(os.path.join(home, ".operator_ssh_keys"))
+    shared_blobs = key_blobs(os.path.join(SHARED, "operator_ssh_keys"))
+    host_wide = not _other_unreleased(slug)
+    removed = 0
+    for path in authorized_keys_paths(slug):
+        removed += _strip_key_file(path, slug, slug_blobs, shared_blobs, host_wide)
+    op = os.path.join(home, ".operator_ssh_keys")
+    if os.path.lexists(op) and not os.path.isdir(op):
+        os.remove(op)
+    if host_wide:
+        shared = os.path.join(SHARED, "operator_ssh_keys")
+        if os.path.isfile(shared) and not os.path.islink(shared):
+            os.remove(shared)
+    return removed
+
+def delete_manager_endpoint(home):
+    for name in (".env", "wa-bridge/.env", "setup.env"):
+        delete_env_keys(os.path.join(home, name), MANAGER_ENV_KEYS)
+    for name in MANAGER_FILES:
+        path = os.path.join(home, name)
+        if os.path.lexists(path) and not os.path.isdir(path):
+            os.remove(path)
+
+def rotate_local_secrets(slug, home):
+    token = rnd(40)
+    setup = rnd(32)
+    owner = tenant_owner(slug)
+    upsert_env(os.path.join(home, ".env"), {"WA_BRIDGE_TOKEN": token}, owner=owner)
+    bridge = os.path.join(home, "wa-bridge", ".env")
+    os.makedirs(os.path.dirname(bridge), exist_ok=True)
+    upsert_env(bridge, {"WA_BRIDGE_TOKEN": token}, owner=owner)
+    write_file(os.path.join(home, ".setup_token"), setup + "\n", 0o600, owner)
+    return ["WA_BRIDGE_TOKEN", "setup_token"]
+
+def restart_tenant_units(slug):
+    if os.environ.get("AGENTSCTL_UNPRIVILEGED_ROOT"):
+        return False
+    if not shutil.which("systemctl"):
+        return False
+    for name in (f"assistant-bridge@{slug}", f"assistant-bot@{slug}", f"assistant-setup@{slug}"):
+        subprocess.run(["systemctl", "try-restart", name], capture_output=True, text=True, timeout=20, check=False)
+    return True
+
+def release_access(slug):
+    """Cut operator access for one slug. Idempotent. Prints no secret values."""
+    need_root()
+    if not SLUG_RE.match(slug or ""):
+        sys.exit("unknown bot")
+    home = os.path.join(ROOT, slug)
+    if slug not in load_reg() and not os.path.isdir(home) and not released(slug):
+        sys.exit("unknown bot")
+    already = released(slug)
+    removed = strip_operator_keys(slug)
+    rotated = []
+    if os.path.isdir(home):
+        delete_manager_endpoint(home)
+        if not already:
+            rotated = rotate_local_secrets(slug, home)
+    if not already:
+        mark_released(slug)
+    restart_tenant_units(slug)
+    result = {"ok": True, "slug": slug, "operator_key_lines_removed": removed,
+              "secrets_rotated": rotated, "manager_endpoint": "absent", "already_released": already}
+    print(json.dumps(result))
+    return result
+
+def _shared_secret_files():
+    found = []
+    if not os.path.isdir(SHARED):
+        return found
+    banned = {".env", ".manager_token", ".setup_token", "id_rsa", "id_ed25519", "authorized_keys"}
+    for dirpath, dirnames, filenames in os.walk(SHARED):
+        dirnames[:] = [d for d in dirnames if d not in SHARED_SKIP]
+        for name in filenames:
+            if name == ".env.example":
+                continue
+            if name in banned or name.endswith(".pem"):
+                found.append(os.path.join(dirpath, name))
+    return found
+
+def _token_in_shared(token):
+    if not token or len(token) < 16 or not os.path.isdir(SHARED):
+        return False
+    for dirpath, dirnames, filenames in os.walk(SHARED):
+        dirnames[:] = [d for d in dirnames if d not in SHARED_SKIP]
+        for name in filenames:
+            path = os.path.join(dirpath, name)
+            try:
+                if os.path.getsize(path) > 2_000_000:
+                    continue
+                data = open(path, encoding="utf-8", errors="ignore").read()
+            except OSError:
+                continue
+            if token in data:
+                return True
+    return False
+
+def _isolation_problems():
+    problems = list(_shared_secret_files())
+    seen = {key: {} for key in UNIQUE_ENV_KEYS}
+    setups = {}
+    for slug in sorted(load_reg()):
+        home = os.path.join(ROOT, slug)
+        if not os.path.isdir(home):
+            problems.append(f"{slug}: missing home")
+            continue
+        if os.stat(home).st_mode & 0o077:
+            problems.append(f"{slug}: home is readable by other users")
+        env_path = os.path.join(home, ".env")
+        if os.path.isfile(env_path) and os.stat(env_path).st_mode & 0o077:
+            problems.append(f"{slug}: .env is readable by other users")
+        env = env_map(env_path)
+        for key in UNIQUE_ENV_KEYS:
+            value = env.get(key, "")
+            if len(value) < 8:
+                continue
+            if value in seen[key]:
+                problems.append(f"{slug}: {key} matches {seen[key][value]}")
+            else:
+                seen[key][value] = slug
+            if _token_in_shared(value):
+                problems.append(f"{slug}: {key} appears under shared code")
+        setup_path = os.path.join(home, ".setup_token")
+        if os.path.isfile(setup_path):
+            if os.stat(setup_path).st_mode & 0o077:
+                problems.append(f"{slug}: setup token file is readable by other users")
+            setup = open(setup_path, encoding="utf-8").read().strip()
+            if len(setup) >= 8:
+                if setup in setups:
+                    problems.append(f"{slug}: setup token matches {setups[setup]}")
+                else:
+                    setups[setup] = slug
+                if _token_in_shared(setup):
+                    problems.append(f"{slug}: setup token appears under shared code")
+        bridge = env_map(os.path.join(home, "wa-bridge", ".env")).get("WA_BRIDGE_TOKEN", "")
+        main_token = env.get("WA_BRIDGE_TOKEN", "")
+        if main_token and bridge and main_token != bridge:
+            problems.append(f"{slug}: bridge token files differ")
+    return problems
+
+def check_isolation(quiet=False):
+    problems = _isolation_problems()
+    if not quiet:
+        print("\n".join(problems) if problems else "isolation ok")
+    return 1 if problems else 0
+
+def _plant_tenant(slug, bridge, setup, openai):
+    home = os.path.join(ROOT, slug)
+    os.makedirs(os.path.join(home, "wa-bridge"), exist_ok=True)
+    os.chmod(home, 0o700)
+    def kv(key, value):
+        return key + "=" + value
+    write_file(os.path.join(home, ".env"), "\n".join([
+        kv("OPENAI_API_KEY", openai),
+        kv("WA_BRIDGE_TOKEN", bridge),
+        kv("MANAGER_URL", "http://127.0.0.1:9"),
+        kv("MANAGER_TOKEN", "old-manager-" + slug),
+        kv("TEAM_REQUEST_URL", "http://127.0.0.1:9/intake"),
+        kv("HEARTBEAT_URL", "http://127.0.0.1:9"),
+        kv("STATUS_REPORT_URL", "http://127.0.0.1:9"),
+    ]) + "\n")
+    write_file(os.path.join(home, "wa-bridge", ".env"), kv("WA_BRIDGE_TOKEN", bridge) + "\n")
+    write_file(os.path.join(home, ".setup_token"), setup + "\n")
+    write_file(os.path.join(home, ".manager_token"), "old-manager-file\n")
+    write_file(os.path.join(home, ".operator_ssh_keys"),
+               f"ssh-ed25519 blob-{slug}-abcdefghijklmn {OPERATOR_MARK} {slug}\n")
+
+def self_check():
+    td = tempfile.mkdtemp(prefix="agentsctl-self-check-")
+    try:
+        _self_check_body(td)
+    except (AssertionError, SystemExit) as exc:
+        print(f"self-check: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        shutil.rmtree(td, ignore_errors=True)
+    print("self-check: ok")
+    return 0
+
+def _self_check_body(td):
+    os.environ["AGENTSCTL_UNPRIVILEGED_ROOT"] = td
+    keys_path = os.path.join(td, "authorized_keys")
+    os.environ["ASSISTANT_AUTHORIZED_KEYS"] = keys_path
+    _use_root(td)
+    os.makedirs(SHARED, exist_ok=True)
+    _plant_tenant("alpha", "bridge-token-alpha-aaaa", "setup-token-alpha-aaaa", "friend-key-alpha")
+    _plant_tenant("beta", "bridge-token-beta-bbbb", "setup-token-beta-bbbb", "friend-key-beta")
+    save_reg({
+        "alpha": {"user": "agent-alpha", "ports": {"bridge": 21000, "inbound": 21001, "setup": 21002}, "created": "t"},
+        "beta": {"user": "agent-beta", "ports": {"bridge": 21010, "inbound": 21011, "setup": 21012}, "created": "t"},
+    })
+    write_file(os.path.join(SHARED, "operator_ssh_keys"), "ssh-ed25519 blob-shared-abcdefghijklmn assistant-operator\n")
+    write_file(keys_path, "\n".join([
+        "ssh-ed25519 blob-alpha-abcdefghijklmn assistant-operator alpha",
+        "ssh-ed25519 blob-beta-abcdefghijklmn assistant-operator beta",
+        "ssh-ed25519 blob-friend-abcdefghijklmn friend-key",
+        "ssh-ed25519 blob-untagged-abcdefghijklmn assistant-operator",
+        "ssh-ed25519 blob-shared-abcdefghijklmn assistant-operator",
+        "",
+    ]))
+    if check_isolation(quiet=True) != 0:
+        raise AssertionError("distinct tenants failed isolation")
+    alpha_env = os.path.join(ROOT, "alpha", ".env")
+    beta_env = os.path.join(ROOT, "beta", ".env")
+    alpha_token = env_map(alpha_env)["WA_BRIDGE_TOKEN"]
+    upsert_env(beta_env, {"WA_BRIDGE_TOKEN": alpha_token})
+    if check_isolation(quiet=True) == 0:
+        raise AssertionError("shared bridge token was not detected")
+    upsert_env(beta_env, {"WA_BRIDGE_TOKEN": "bridge-token-beta-bbbb"})
+    os.chmod(beta_env, 0o644)
+    if check_isolation(quiet=True) == 0:
+        raise AssertionError("world-readable env was not detected")
+    os.chmod(beta_env, 0o600)
+    if check_isolation(quiet=True) != 0:
+        raise AssertionError("isolation failed after restoring modes")
+    first = release_access("alpha")
+    if first["already_released"] or first["secrets_rotated"] != ["WA_BRIDGE_TOKEN", "setup_token"]:
+        raise AssertionError("first release did not rotate once")
+    if first["operator_key_lines_removed"] != 1:
+        raise AssertionError("first release removed the wrong operator keys")
+    text = open(keys_path, encoding="utf-8").read()
+    if "assistant-operator alpha" in text:
+        raise AssertionError("operator key for the released slug is still authorized")
+    if "assistant-operator beta" not in text:
+        raise AssertionError("other slug operator key was removed")
+    if "friend-key" not in text:
+        raise AssertionError("non-operator key was removed")
+    if "blob-untagged-abcdefghijklmn" not in text or "blob-shared-abcdefghijklmn" not in text:
+        raise AssertionError("host operator key removed while another tenant is active")
+    env = env_map(alpha_env)
+    for key in MANAGER_ENV_KEYS:
+        if key in env:
+            raise AssertionError("manager hook still set")
+    if env.get("OPENAI_API_KEY") != "friend-key-alpha":
+        raise AssertionError("friend key was changed")
+    if env.get("WA_BRIDGE_TOKEN") == "bridge-token-alpha-aaaa":
+        raise AssertionError("bridge token was not rotated")
+    if env.get("WA_BRIDGE_TOKEN") != env_map(os.path.join(ROOT, "alpha", "wa-bridge", ".env")).get("WA_BRIDGE_TOKEN"):
+        raise AssertionError("bridge token files differ after rotation")
+    if os.path.exists(os.path.join(ROOT, "alpha", ".manager_token")):
+        raise AssertionError("manager token file still present")
+    if os.path.exists(os.path.join(ROOT, "alpha", ".operator_ssh_keys")):
+        raise AssertionError("operator key list still stored for the slug")
+    if env_map(beta_env).get("WA_BRIDGE_TOKEN") != "bridge-token-beta-bbbb":
+        raise AssertionError("other tenant secret changed")
+    if not os.path.isfile(os.path.join(SHARED, "operator_ssh_keys")):
+        raise AssertionError("shared operator key list removed too early")
+    rotated = env.get("WA_BRIDGE_TOKEN")
+    second = release_access("alpha")
+    if not second["already_released"] or second["secrets_rotated"]:
+        raise AssertionError("second release was not idempotent")
+    if env_map(alpha_env).get("WA_BRIDGE_TOKEN") != rotated:
+        raise AssertionError("second release rotated secrets again")
+    if "MANAGER_URL" in env_map(alpha_env):
+        raise AssertionError("manager endpoint returned")
+    last = release_access("beta")
+    if last["operator_key_lines_removed"] != 3:
+        raise AssertionError("last release did not remove remaining operator keys")
+    text = open(keys_path, encoding="utf-8").read()
+    if "assistant-operator" in text:
+        raise AssertionError("operator key remains after the last tenant was released")
+    if "friend-key" not in text:
+        raise AssertionError("non-operator key was removed")
+    if os.path.isfile(os.path.join(SHARED, "operator_ssh_keys")):
+        raise AssertionError("shared operator key list remains")
+    if check_isolation(quiet=True) != 0:
+        raise AssertionError("isolation failed after release")
+
 def main():
     ap = argparse.ArgumentParser(prog="agentsctl")
     sp = ap.add_subparsers(dest="cmd", required=True)
@@ -267,6 +728,9 @@ def main():
     e = sp.add_parser("export"); e.add_argument("slug"); e.add_argument("dst")
     i = sp.add_parser("invite"); i.add_argument("--count", type=int, default=1)
     sp.add_parser("process-requests")
+    sp.add_parser("release-access").add_argument("slug")
+    sp.add_parser("check-isolation")
+    sp.add_parser("self-check")
     a = ap.parse_args()
     if a.cmd == "create": create(a.slug, a.bot_name, a.owner_name, a.owner_phone, start=not a.no_start, force=a.force)
     elif a.cmd == "list": cmd_list()
@@ -283,6 +747,10 @@ def main():
         old = open(INVITES).read() if os.path.exists(INVITES) else ""
         write_file(INVITES, old + "".join(c + "\n" for c in codes)); print("\n".join(codes))
     elif a.cmd == "process-requests": process_requests()
+    elif a.cmd == "release-access": release_access(a.slug)
+    elif a.cmd == "check-isolation":
+        need_root(); sys.exit(check_isolation())
+    elif a.cmd == "self-check": sys.exit(self_check())
 
 if __name__ == "__main__":
     main()

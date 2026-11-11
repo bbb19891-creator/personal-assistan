@@ -1,0 +1,9 @@
+[Unit]
+Description=Assistant bot %i - release request from the tenant
+
+[Path]
+PathChanged=/opt/agents/%i/.release-request
+Unit=assistant-release@%i.service
+
+[Install]
+WantedBy=multi-user.target
