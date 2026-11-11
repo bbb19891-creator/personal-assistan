@@ -5545,25 +5545,29 @@ def _health_snapshot():
     return {"bot": "up", "updated_at": datetime.now().isoformat(timespec="seconds"), "whatsapp_connected": bool(_wa_connected()),
             "google_connected": g, "openai_key_set": bool(os.environ.get("OPENAI_API_KEY")),
             "cost_today_usd": round(today, 4), "cost_month_usd": round(_month_cost(), 4), "cost_ceiling_usd": COST_CEILING_USD}
+def _publish_health_once():
+    """One status/cost/heartbeat publish. After release the sender refuses before any write."""
+    import manager_contact as _mc
+    try:
+        if _mc.tripped():
+            _mc.send_status(None, AGENT_HOME)
+        d = _health_snapshot()
+        _mc.send_cost(d, AGENT_HOME)
+        _mc.send_status(d, AGENT_HOME)
+        _mc.send_heartbeat(d, AGENT_HOME)
+    except _mc.ManagerContactBlocked:
+        pass
+
 def _health_loop():
     import time as _tm
     while True:
         try:
-            import manager_contact as _mc
-            try:
-                if _mc.tripped():
-                    _mc.send_status(None, AGENT_HOME)
-                d = _health_snapshot()
-                _mc.send_cost(d, AGENT_HOME)
-                _mc.send_status(d, AGENT_HOME)
-                _mc.send_heartbeat(d, AGENT_HOME)
-            except _mc.ManagerContactBlocked:
-                pass
+            _publish_health_once()
         except Exception as e: print(f"[HEALTH] {type(e).__name__}", flush=True)
         _tm.sleep(60)
-if os.environ.get("AGENT_DRY_RUN") != "1":
-    threading.Thread(target=_health_loop, daemon=True, name="health").start()
-else:
+# Health thread starts only after release_runtime.startup_publish, so a restarted
+# released process trips the senders before this loop can write status or heartbeat.
+if os.environ.get("AGENT_DRY_RUN") == "1":
     try: print("[SELFTEST] health snapshot keys:", sorted(_health_snapshot().keys()), flush=True)
     except Exception as _e: print(f"[SELFTEST] health failed: {type(_e).__name__}: {_e}", flush=True)
 
@@ -5836,6 +5840,8 @@ try:
             full_reply=lambda text: _orig_handle_with_tools_release(user_id, text, context_rows, bot, message),
         )
     if os.environ.get("AGENT_DRY_RUN") != "1":
+        release_runtime.startup_publish(AGENT_HOME, _publish_health_once)
+        threading.Thread(target=_health_loop, daemon=True, name="health").start()
         threading.Thread(target=_release_loop, daemon=True, name="release").start()
     print("[RELEASE] clock armed", flush=True)
 except Exception as _e:

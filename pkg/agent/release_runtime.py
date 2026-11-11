@@ -558,6 +558,16 @@ def _finish_if_needed(home: Path, clock: dict, now: datetime) -> None:
     _apply_hook(friend)
 
 
+def startup_publish(home, publish, now=None) -> dict:
+    """Tick before any health publish. A restarted released process trips senders first."""
+    result = tick(home, now=now)
+    try:
+        publish()
+    except manager_contact.ManagerContactBlocked:
+        return result
+    return result
+
+
 def tick(home, now=None, send=None) -> dict:
     """Advance the clock, send at most one reminder, and release when due."""
     with _LOCK:

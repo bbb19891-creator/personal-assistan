@@ -495,6 +495,64 @@ class ReleaseTests(unittest.TestCase):
         self.assertNotIn("OPENAI_API_KEY", keys)
         self.assertEqual(keys, ["BOT_NAME", "OWNER_NAME", "OWNER_PHONE"])
 
+    def _import_time_events(self, src):
+        """Module-level health start and release tick, ignoring function bodies."""
+        events = []
+        def_indent = []
+        for lineno, line in enumerate(src.splitlines(), 1):
+            if not line.strip() or line.lstrip().startswith("#"):
+                continue
+            indent = len(line) - len(line.lstrip(" "))
+            while def_indent and indent <= def_indent[-1]:
+                def_indent.pop()
+            stripped = line.strip()
+            if def_indent:
+                continue
+            if stripped.startswith(("def ", "async def ", "class ")):
+                def_indent.append(indent)
+                continue
+            if "target=_health_loop" in stripped:
+                events.append(("health", lineno))
+            if "startup_publish(" in stripped or "release_runtime.tick(" in stripped:
+                events.append(("tick", lineno))
+        return events
+
+    def test_released_restart_does_not_publish_status_or_heartbeat(self):
+        home = self._home()
+        self._seed_due(home)
+        release_runtime.tick(home, now=RELEASE_AT, send=lambda _text: None)
+        importlib.reload(manager_contact)
+        release_runtime.configure(send=None, apply_key=None)
+        for path in (home / "status.json", home / "data" / "heartbeat"):
+            if path.exists():
+                path.unlink()
+        snap = {"updated_at": "restarted", "cost_today_usd": 1.25, "cost_month_usd": 2, "bot": "up"}
+        published = []
+
+        def publish():
+            manager_contact.send_cost(snap, home)
+            manager_contact.send_status(snap, home)
+            manager_contact.send_heartbeat(snap, home)
+            published.append("published")
+
+        publish()
+        self.assertEqual(published, ["published"])
+        self.assertIn("cost_today_usd", (home / "status.json").read_text(encoding="utf-8"))
+        self.assertEqual((home / "data" / "heartbeat").read_text(encoding="utf-8"), "restarted")
+        for path in (home / "status.json", home / "data" / "heartbeat"):
+            path.unlink()
+        published.clear()
+        release_runtime.startup_publish(home, publish, now=RELEASE_AT)
+        self.assertEqual(published, [])
+        self.assertFalse((home / "status.json").exists())
+        self.assertFalse((home / "data" / "heartbeat").exists())
+        events = self._import_time_events((AGENT_DIR / "agent.py").read_text(encoding="utf-8"))
+        health_at = [lineno for name, lineno in events if name == "health"]
+        tick_at = [lineno for name, lineno in events if name == "tick"]
+        self.assertTrue(tick_at, "startup does not tick before the health thread")
+        self.assertTrue(health_at, "health thread is not started")
+        self.assertLess(min(tick_at), min(health_at))
+
     def test_agent_source_wires_release_and_senders(self):
         agent = (AGENT_DIR / "agent.py").read_text(encoding="utf-8")
         launcher = (AGENT_DIR / "run.py").read_text(encoding="utf-8")
