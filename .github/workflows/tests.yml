@@ -1,0 +1,30 @@
+name: tests
+
+# Area suites land in later pull requests. This job runs them when the
+# directories exist and skips a missing path with a log line. It does not
+# replace or relax .github/workflows/secrets.yml.
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  area-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pytest
+        run: python3 -m pip install --disable-pip-version-check pytest==9.2.0
+
+      - name: Run area tests
+        run: bash .github/scripts/run-area-tests.sh
