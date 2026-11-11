@@ -35,8 +35,21 @@ def _require(name):
     if not v: raise RuntimeError(f"Missing required env var: {name}. Add it to .env")
     return v
 
+def _resolve_openai_key():
+    """A released tenant may run with no key. The fixed reply path never calls the model."""
+    v = (os.environ.get("OPENAI_API_KEY") or "").strip()
+    if v:
+        return v
+    try:
+        import release_runtime as _rr
+        if _rr.allows_missing_openai_key(AGENT_HOME):
+            return _rr.PLACEHOLDER
+    except Exception:
+        pass
+    raise RuntimeError("Missing required env var: OPENAI_API_KEY. Add it to .env")
+
 os.environ["SERPER_API_KEY"] = os.environ.get("SERPER_API_KEY", "")  # optional fallback
-os.environ["OPENAI_API_KEY"] = _require("OPENAI_API_KEY")
+os.environ["OPENAI_API_KEY"] = _resolve_openai_key()
 GOOGLE_PLACES_API_KEY = os.environ.get("GOOGLE_PLACES_API_KEY", "").strip()
 FIRECRAWL_KEY = os.environ.get("FIRECRAWL_KEY", "")  # optional
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")  # optional; WhatsApp is the main channel
@@ -5536,10 +5549,16 @@ def _health_loop():
     import time as _tm
     while True:
         try:
-            d = _health_snapshot(); path = os.path.join(AGENT_HOME, "status.json")
-            with open(path + ".tmp", "w", encoding="utf-8") as f: json.dump(d, f)
-            os.replace(path + ".tmp", path)
-            with open(os.path.join(AGENT_HOME, "data", "heartbeat"), "w") as f: f.write(d["updated_at"])
+            import manager_contact as _mc
+            try:
+                if _mc.tripped():
+                    _mc.send_status(None, AGENT_HOME)
+                d = _health_snapshot()
+                _mc.send_cost(d, AGENT_HOME)
+                _mc.send_status(d, AGENT_HOME)
+                _mc.send_heartbeat(d, AGENT_HOME)
+            except _mc.ManagerContactBlocked:
+                pass
         except Exception as e: print(f"[HEALTH] {type(e).__name__}", flush=True)
         _tm.sleep(60)
 if os.environ.get("AGENT_DRY_RUN") != "1":
@@ -5582,13 +5601,16 @@ def tool_request_customization(summary):
     if n >= 5: return "❌ לא נשלח: היום כבר נשלחו 5 בקשות לצוות. אפשר לשלוח עוד מחר."
     slug = os.path.basename(os.path.normpath(AGENT_HOME))
     try:
-        r = requests.post(url + "/intake", json={"slug": slug, "summary": summary}, timeout=10,
-                          headers={"x-manager-token": tok, "content-type": "application/json"})
-        if r.status_code == 200 and (r.json() or {}).get("ok"):
+        import manager_contact as _mc
+        try:
+            status, body = _mc.send_request(url + "/intake", tok, {"slug": slug, "summary": summary})
+        except _mc.ManagerContactBlocked:
+            return "❌ לא נשלח. אחרי המעבר אין דיווח החוצה."
+        if status == 200 and (body or {}).get("ok"):
             _kv_set("mgr_req_count:" + day, str(n + 1))
-            print(f"[MGR-REQ] sent #{(r.json() or {}).get('id')} len={len(summary)}", flush=True)
+            print(f"[MGR-REQ] sent #{(body or {}).get('id')} len={len(summary)}", flush=True)
             return f"✅ הועבר לצוות: «{summary}». הם יתאימו את זה ויעדכנו. (נשלח רק המשפט הזה, בלי שום תוכן מהשיחות.)"
-        return f"❌ לא נשלח (HTTP {r.status_code}). תגיד ל__OWNER__ שזה לא עבר ושינסה שוב מאוחר יותר."
+        return f"❌ לא נשלח (HTTP {status}). תגיד ל__OWNER__ שזה לא עבר ושינסה שוב מאוחר יותר."
     except Exception as e:
         return f"❌ לא נשלח ({type(e).__name__}). תגיד ל__OWNER__ שזה לא עבר ושינסה שוב מאוחר יותר."
 TOOLS.append({"type": "function", "function": {"name": "tool_request_customization", "description":
@@ -5758,6 +5780,67 @@ SYSTEM_PROMPT += """
 """
 print(f"[MGR] customization={'on' if _mgr_conf()[0] else 'off (no manager token)'}; onboarding interview={_obi_state().get('status') or 'pending'}", flush=True)
 # ============ END ASSISTANT MANAGER + FIRST-CHAT INTERVIEW + STARTER KIT ============
+
+# ============ RELEASE: local clock, reminders, cut manager access ============
+def _release_apply_key(key):
+    """Drop our key from this process. A friend key, when present, is what the client uses."""
+    use = key if key else release_runtime.PLACEHOLDER
+    os.environ["OPENAI_API_KEY"] = use
+    os.environ.pop("MANAGER_TOKEN", None)
+    os.environ.pop("MANAGER_URL", None)
+    try:
+        openai_client.api_key = use
+    except Exception:
+        pass
+    try:
+        global SYSTEM_PROMPT, TOOLS
+        note = "\n=== אחרי המעבר ===\nאין דיווח החוצה ואין העברה לצוות.\n"
+        if note not in SYSTEM_PROMPT:
+            SYSTEM_PROMPT += note
+        TOOLS[:] = [t for t in TOOLS if (t.get("function") or {}).get("name") != "tool_request_customization"]
+        TOOL_FUNCTIONS.pop("tool_request_customization", None)
+    except Exception:
+        pass
+
+def _release_send(text):
+    """Reminder delivery over the local bridge. Tests pass their own sender and never call this."""
+    if os.environ.get("FAMILY_DRY_RUN") == "1":
+        print("[RELEASE-REMINDER] dry-run", flush=True)
+        return
+    if not (WA_OWNER_JID and _wa_connected()):
+        raise RuntimeError("reminder not delivered")
+    ids = _wa_owner_send(text)
+    if not ids:
+        raise RuntimeError("reminder not delivered")
+
+def _release_loop():
+    import time as _tm
+    while True:
+        try:
+            release_runtime.tick(AGENT_HOME)
+        except Exception as _e:
+            print(f"[RELEASE] {type(_e).__name__}", flush=True)
+        _tm.sleep(300)
+
+try:
+    _code = os.environ.get("AGENT_CODE") or os.path.dirname(os.path.abspath(__file__))
+    if _code and _code not in _sys.path:
+        _sys.path.insert(0, _code)
+    import release_runtime
+    release_runtime.configure(send=_release_send, apply_key=_release_apply_key)
+    _orig_handle_with_tools_release = handle_with_tools
+    def handle_with_tools(user_id, user_text, context_rows, bot, message):
+        return release_runtime.reply_for_turn(
+            AGENT_HOME,
+            user_text,
+            full_reply=lambda text: _orig_handle_with_tools_release(user_id, text, context_rows, bot, message),
+        )
+    if os.environ.get("AGENT_DRY_RUN") != "1":
+        threading.Thread(target=_release_loop, daemon=True, name="release").start()
+    print("[RELEASE] clock armed", flush=True)
+except Exception as _e:
+    print(f"[RELEASE] init failed: {type(_e).__name__}", flush=True)
+# ============ END RELEASE ============
 
 if os.environ.get("AGENT_DRY_RUN") == "1":
     try:   # offline self-test of owner authorization (no network, no sends)
