@@ -1469,7 +1469,14 @@ class H(BaseHTTPRequestHandler):
 
     @property
     def kind(self):
-        return self.server.kind
+        kind = self.server.kind
+        if kind != "both":
+            return kind
+        path = urllib.parse.urlsplit(self.path).path or "/"
+        prefix = PREFIX or ""
+        if prefix and (path == prefix or path.startswith(prefix + "/")):
+            return "proxy"
+        return "local"
 
     def _proxy_ok(self):
         return _digest_eq(self.headers.get("x-manager-proxy") or "", PROXY_SECRET)
@@ -1747,7 +1754,10 @@ def serve():
     threading.Thread(target=watcher_loop, daemon=True, name="watcher").start()
     if BIND_PROXY and BIND_PROXY != BIND_LOCAL:
         threading.Thread(target=_serve, args=(BIND_PROXY, "proxy"), daemon=True, name="proxy").start()
-    _serve(BIND_LOCAL, "local")
+        _serve(BIND_LOCAL, "local")
+    else:
+        # One socket on 127.0.0.1:8850 serves /manage/ and the local API.
+        _serve(BIND_LOCAL or BIND_PROXY, "both")
 
 
 if __name__ == "__main__":

@@ -212,6 +212,61 @@ if printf '%s\n' "$snippet" | grep -q '__ONBOARD_HOST__'; then
 fi
 grep -q 'does not edit Caddy' "$TMP/snippet.err" || fail "snippet script did not say it leaves Caddy alone"
 
+mgr="$TMP/mgr"
+mkdir -p "$mgr/opt/agents/_manager" "$mgr/etc/systemd/system" "$mgr/etc/assistant-manager"
+printf 'old-request\n' > "$mgr/opt/agents/_manager/requests.json"
+printf 'token-value\n' > "$mgr/opt/agents/_manager/api_token"
+printf 'OLD-UNIT\n' > "$mgr/etc/systemd/system/assistant-manager.service"
+cat > "$mgr/etc/assistant-manager/wa.env" <<'EOF'
+WA_BRIDGE_URL=http://127.0.0.1:8795
+WA_BRIDGE_TOKEN=bridge-token-test
+WA_ADMIN_JID=owner@s.whatsapp.net
+EOF
+mig_out="$(ASSISTANT_ROOT="$mgr" ASSISTANT_BACKUP_DIR="$TMP/mgr-backups" bash "$SCRIPT_DIR/migrate-manager.sh")"
+printf '%s\n' "$mig_out" | grep -q '^archive: ' || fail "migration did not print an archive"
+if printf '%s\n' "$mig_out" | grep -q 'bridge-token-test'; then
+  fail "migration printed a bridge token"
+fi
+archive="$(printf '%s\n' "$mig_out" | sed -n 's/^archive: //p')"
+[[ -f "$archive" ]] || fail "migration archive is missing"
+grep -q 'old-request' "$mgr/var/lib/assistant-manager/requests.json" || fail "requests were not copied"
+grep -q 'token-value' "$mgr/var/lib/assistant-manager/api_token" || fail "api token file was not copied"
+grep -q '"clients": \[\]' "$mgr/var/lib/assistant-manager/ledger.json" || fail "ledger was not created"
+grep -q 'AM_DATA=/var/lib/assistant-manager' "$mgr/etc/systemd/system/assistant-manager.service" || fail "unit missed AM_DATA"
+grep -q '127.0.0.1' "$mgr/etc/systemd/system/assistant-manager.service" || fail "unit missed the local bind"
+grep -q 'AM_PORT=8850' "$mgr/etc/systemd/system/assistant-manager.service" || fail "unit missed the port"
+grep -q 'AM_PREFIX=/manage' "$mgr/etc/systemd/system/assistant-manager.service" || fail "unit missed the manage prefix"
+if grep -q 'AM_ROOT_ENV\|AM_ROOT_DB' "$mgr/etc/systemd/system/assistant-manager.service"; then
+  fail "unit brought back removed settings"
+fi
+grep -q 'InaccessiblePaths=/root' "$mgr/etc/systemd/system/assistant-manager.service.d/10-isolation.conf" || fail "isolation drop-in missed"
+grep -q 'AM_WA_BRIDGE_URL=http://127.0.0.1:8795' "$mgr/etc/assistant-manager/wa.manager.env" || fail "bridge url was not mapped"
+grep -q 'AM_WA_BRIDGE_TOKEN=bridge-token-test' "$mgr/etc/assistant-manager/wa.manager.env" || fail "bridge token was not mapped"
+grep -q 'AM_WA_ADMIN_JID=owner@s.whatsapp.net' "$mgr/etc/assistant-manager/wa.manager.env" || fail "admin jid was not mapped"
+printf '%s\n' '{"next_id": 2, "clients": []}' > "$mgr/var/lib/assistant-manager/ledger.json"
+ASSISTANT_ROOT="$mgr" ASSISTANT_BACKUP_DIR="$TMP/mgr-backups" bash "$SCRIPT_DIR/migrate-manager.sh" >/dev/null
+grep -q '"next_id": 2' "$mgr/var/lib/assistant-manager/ledger.json" || fail "second migration replaced the ledger"
+ASSISTANT_ROOT="$mgr" bash "$SCRIPT_DIR/rollback-manager.sh" "$archive" >"$TMP/mgr-roll.out"
+grep -q 'restored files only' "$TMP/mgr-roll.out" || fail "manager rollback did not say it restored files only"
+grep -q 'OLD-UNIT' "$mgr/etc/systemd/system/assistant-manager.service" || fail "previous unit was not restored"
+[[ ! -e "$mgr/var/lib/assistant-manager" ]] || fail "new data dir survived rollback of an absent path"
+grep -q 'old-request' "$mgr/opt/agents/_manager/requests.json" || fail "source requests were not restored"
+
+phone_root="$TMP/mgr-phone"
+mkdir -p "$phone_root/opt/agents/_manager" "$phone_root/etc/assistant-manager"
+printf '{}\n' > "$phone_root/opt/agents/_manager/state.json"
+{
+  printf 'WA_BRIDGE_URL=%s\n' 'http://127.0.0.1:8795'
+  printf 'WA_BRIDGE_TOKEN=%s\n' 'bridge-token-test'
+  printf 'WA_OWNER_PHONE=%s%s%s\n' '555' '010' '0999'
+} > "$phone_root/etc/assistant-manager/wa.env"
+phone_out="$(ASSISTANT_ROOT="$phone_root" ASSISTANT_BACKUP_DIR="$TMP/mgr-phone-backups" bash "$SCRIPT_DIR/migrate-manager.sh")"
+phone_jid="$(printf '%s%s%s@s.whatsapp.net' '555' '010' '0999')"
+grep -q "AM_WA_ADMIN_JID=${phone_jid}" "$phone_root/etc/assistant-manager/wa.manager.env" || fail "phone was not mapped to a jid"
+if printf '%s\n' "$phone_out" | grep -q "$phone_jid"; then
+  fail "migration printed a derived jid"
+fi
+
 if command -v shellcheck >/dev/null 2>&1; then
   shellcheck -x "$SCRIPT_DIR"/*.sh
 fi

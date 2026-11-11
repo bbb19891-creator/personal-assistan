@@ -9,6 +9,8 @@ SCRIPT = ROOT / ".github" / "scripts" / "run-area-tests.sh"
 
 PYTEST_DIRS = ("pkg/agent/tests", "central/tests", "platform/tests", "tests")
 SELFHOST = "pkg/host/check-selfhost.sh"
+BOOTSTRAP = "tests/check-bootstrap.sh"
+AREA_PATHS = (*PYTEST_DIRS, SELFHOST, BOOTSTRAP)
 
 
 def _run(root: Path) -> subprocess.CompletedProcess[str]:
@@ -24,7 +26,7 @@ def _run(root: Path) -> subprocess.CompletedProcess[str]:
 def test_script_and_workflow_name_every_area_path() -> None:
     script = SCRIPT.read_text(encoding="utf-8")
     workflow = (ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="utf-8")
-    for path in (*PYTEST_DIRS, SELFHOST):
+    for path in AREA_PATHS:
         assert path in script
     assert "bash .github/scripts/run-area-tests.sh" in workflow
     assert "pytest==9.2.0" in workflow
@@ -34,7 +36,7 @@ def test_script_and_workflow_name_every_area_path() -> None:
 def test_missing_paths_are_skipped(tmp_path: Path) -> None:
     result = _run(tmp_path)
     assert result.returncode == 0, result.stderr
-    for path in (*PYTEST_DIRS, SELFHOST):
+    for path in AREA_PATHS:
         assert f"skip: {path} does not exist yet" in result.stdout
     assert "running pytest" not in result.stdout
     assert "running pkg/host/check-selfhost.sh" not in result.stdout

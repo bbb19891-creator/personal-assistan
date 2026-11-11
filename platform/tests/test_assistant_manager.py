@@ -181,6 +181,25 @@ class ManagerTests(unittest.TestCase):
             return ""
         return path.read_text(encoding="utf-8")
 
+    def test_one_port_serves_manage_page_and_intake(self):
+        port = self._start("both")
+        status, page = self._page(port, "/manage/")
+        self.assertEqual(status, 200)
+        self.assertIn("מנהל העוזרים", page)
+        denied = urllib.request.Request("http://127.0.0.1:%d/manage/" % port)
+        try:
+            urllib.request.urlopen(denied, timeout=5)
+            self.fail("manage page accepted a request without the proxy header")
+        except urllib.error.HTTPError as exc:
+            self.assertEqual(exc.code, 403)
+        status, body = self._api(
+            port, "POST", "/intake",
+            {"slug": "not-a-tenant", "summary": "hello there"},
+            token="not-the-token",
+        )
+        self.assertEqual(status, 403)
+        self.assertFalse(body.get("ok"))
+
     def test_ledger_starts_empty(self):
         led = am.load_ledger()
         self.assertEqual(led["clients"], [])

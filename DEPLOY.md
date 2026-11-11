@@ -126,6 +126,12 @@ sudo bash docs/deploy/apply-tenant-host.sh dedicated --domain example.invalid
 
 The installer command is `sudo bash pkg/install.sh --yes --domain example.invalid`. The wrapper does not accept `--setup-token` or `--dry-run`. `--restore FILE` is passed through when you set it. Do not point `--restore` at a file inside `/opt/agent`.
 
+### Public bootstrap
+
+A friend with a blank Ubuntu machine does not have this checkout. The repository root `install.sh` is the file behind `curl -fsSL <raw url> | sudo bash`. Stdin is not a terminal. The script refuses an API token flag and does not print the value. It decodes the repository coordinates, downloads a pinned `codeload.github.com` archive, checks the sha256 in the script, and runs `SELF_HOST=1 bash pkg/install.sh --yes`. `REF` overrides the pin. An empty checksum is exit 2. This file does not contain the account name or the raw url. `install.sha256`, when present, is the same checksum.
+
+This change did not run that command on a live server. The container test is `bash tests/check-bootstrap.sh`. A machine without docker and without podman fails that test. That failure is not a pass.
+
 `pkg/deploy/cloud-init.yaml` is still a paste into the Hetzner create-server form. Replace `__PKG_URL__` with an `https` URL that does not contain an account name. The placeholder is `https://example.invalid/agent.tar.gz`. Replace `__SETUP_TOKEN__` on the server, not in git:
 
 ```bash
@@ -200,7 +206,9 @@ There is no new installer and no new flag. `pkg/host/install-host.sh` copies `pk
 
 ## 6. Pull request 7, pilot ledger
 
-`platform/assistant_manager.py` accepts only `serve`, `provision`, `tick`, and `render`. `AM_DATA` is required. A path whose second component is `root` is rejected. There is no unit file in this pull request. Do not invent a `systemctl enable` for it.
+`platform/assistant_manager.py` accepts only `serve`, `provision`, `tick`, and `render`. `AM_DATA` is required. A path whose second component is `root` is rejected. A row that is due is deleted by the same `delete_client` path as an explicit delete. That includes the row, status history, costs, requests, and invite codes.
+
+The live unit is `assistant-manager`. It stays on `127.0.0.1:8850`. The admin page stays at `/manage/` behind the Caddy basic auth that already proxies that path. This runbook does not edit Caddy and does not claim a reload.
 
 Use `/var/lib/assistant-manager` unless you have another path outside `/root`. Back up before the first write:
 
@@ -216,6 +224,57 @@ sudo AM_DATA=/var/lib/assistant-manager AM_DRY_RUN=1 AM_PUBLIC_ORIGIN=https://ex
 ```
 
 `render` writes the page to stdout and creates files under `AM_DATA`. `serve` binds a port and was not run. `provision` and `tick` were not run. To undo the data directory, restore the `manager` archive. That removes files the backup recorded, including a directory that was absent when the backup was taken.
+
+### Live manager migration
+
+The machine that already runs the manager keeps its data in `/opt/agents/_manager`. The unit that is there today starts `python3 /usr/local/lib/assistant-manager/assistant_manager.py serve` with `AM_ROOT_ENV=/etc/assistant-manager/wa.env` and `AM_ROOT_DB=/nonexistent/memory.db`. The new program does not read those two settings and does not open a database. Alerts use `AM_WA_BRIDGE_URL`, `AM_WA_BRIDGE_TOKEN`, and `AM_WA_ADMIN_JID`.
+
+| Old | New |
+| --- | --- |
+| `AM_ROOT_ENV=/etc/assistant-manager/wa.env` | read that file on the server; do not commit it |
+| `WA_BRIDGE_URL` | `AM_WA_BRIDGE_URL` |
+| `WA_BRIDGE_TOKEN` | `AM_WA_BRIDGE_TOKEN` |
+| `WA_ADMIN_JID` | `AM_WA_ADMIN_JID` |
+| `WA_OWNER_PHONE` when the jid is empty | digits from that value, then `@s.whatsapp.net` |
+| `AM_ROOT_DB=/nonexistent/memory.db` | not opened. The new program has no database setting |
+
+The migration script writes `/etc/assistant-manager/wa.manager.env` mode `600` and does not print the values. The unit loads that file with `EnvironmentFile=`. It does not set `AM_DRY_RUN`. Alerts go out through `POST /send/text` on the bridge URL with the header `x-wa-token`.
+
+Files copied when the new path does not already have them: `requests.json`, `state.json`, `api_token`, `proxy_secret`, `outbox.log`. Created when missing: `ledger.json`, `invites.json`, `costs.json`, `status_history.json`. A second run keeps a file that is already in `/var/lib/assistant-manager`.
+
+The script also installs:
+
+- `/usr/local/lib/assistant-manager/assistant_manager.py`
+- `/etc/systemd/system/assistant-manager.service`
+- `/etc/systemd/system/assistant-manager.service.d/10-isolation.conf`
+
+`10-isolation.conf` keeps the process off `/root`. One listener on `127.0.0.1:8850` serves `/manage/` when the proxy header matches `proxy_secret`, and serves intake on the same socket. Leave the existing Caddy basic auth in front of `/manage/`.
+
+```bash
+sudo bash docs/deploy/migrate-manager.sh
+```
+
+The script prints `archive: /var/backups/assistant-deploy/manager-before-STAMP.tar.gz`. That first archive is the one that puts the previous unit and `/opt/agents/_manager` back. A later run writes another archive of the already migrated tree. The script does not run `systemctl`.
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl restart assistant-manager
+systemctl is-active assistant-manager
+curl -fsS http://127.0.0.1:8850/healthz
+```
+
+These four commands were not run on the live server.
+
+To undo, stop the service yourself, restore the first archive, then reload and start it yourself:
+
+```bash
+sudo systemctl stop assistant-manager
+sudo bash docs/deploy/rollback-manager.sh /var/backups/assistant-deploy/manager-before-STAMP.tar.gz
+sudo systemctl daemon-reload
+sudo systemctl restart assistant-manager
+```
+
+`rollback-manager.sh` restores files only. It does not call `systemctl`. That restore was not run on the live server. A rehearsal under `ASSISTANT_ROOT` is what `docs/deploy/self-check.sh` runs.
 
 ## 7. Wrappers
 

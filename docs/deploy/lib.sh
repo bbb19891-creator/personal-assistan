@@ -28,6 +28,10 @@ path_allowed() {
     /etc/systemd/system/assistant-status.timer) return 0 ;;
     /etc/systemd/system/assistant-release@.service) return 0 ;;
     /etc/systemd/system/assistant-release@.path) return 0 ;;
+    /etc/systemd/system/assistant-manager.service) return 0 ;;
+    /etc/systemd/system/assistant-manager.service.d|/etc/systemd/system/assistant-manager.service.d/*) return 0 ;;
+    /usr/local/lib/assistant-manager|/usr/local/lib/assistant-manager/*) return 0 ;;
+    /etc/assistant-manager|/etc/assistant-manager/*) return 0 ;;
     /var/lib/assistant-manager|/var/lib/assistant-manager/*) return 0 ;;
     /root/SETUP_LINK.txt) return 0 ;;
     *) return 1 ;;
@@ -39,6 +43,7 @@ unit_allowed() {
   case "$1" in
     agent-onboarding|assistant-bridge|assistant-setup|assistant-bot) return 0 ;;
     assistant-status.timer|assistant-provision.path|assistant-provision.service) return 0 ;;
+    assistant-manager) return 0 ;;
     *) return 1 ;;
   esac
 }

@@ -42,3 +42,10 @@ if [ -f "$ROOT/pkg/host/check-selfhost.sh" ]; then
 else
   echo "skip: pkg/host/check-selfhost.sh does not exist yet"
 fi
+
+if [ -f "$ROOT/tests/check-bootstrap.sh" ]; then
+  echo "running tests/check-bootstrap.sh"
+  ( cd "$ROOT" && bash tests/check-bootstrap.sh )
+else
+  echo "skip: tests/check-bootstrap.sh does not exist yet"
+fi
