@@ -41,13 +41,13 @@ else
 fi
 
 unit="$REPO_ROOT/central/agent-onboarding.service"
-archive_path="$REPO_ROOT/agent-template.tar.gz"
+deploy_sh="$REPO_ROOT/central/deploy.sh"
 if [[ "$print_only" -eq 1 && -n "${ASSISTANT_REHEARSE:-}" ]]; then
   unit="${ASSISTANT_UNIT_FILE:-$unit}"
-  archive_path="${ASSISTANT_TEMPLATE_TAR:-$archive_path}"
+  deploy_sh="${ASSISTANT_DEPLOY_SH:-$deploy_sh}"
 fi
 
-onboard_blockers "$unit" "$archive_path"
+onboard_blockers "$unit" "$deploy_sh"
 
 paths=(
   /opt/agent-onboarding
@@ -57,9 +57,7 @@ paths=(
 units=(agent-onboarding)
 
 if [[ "$print_only" -eq 1 ]]; then
-  if [[ ! -f "$REPO_ROOT/tools/package.sh" ]]; then
-    printf '%s\n' "note: tools/package.sh is not in this repository. central/deploy.sh only checks that the archive file exists. This wrapper does not inspect the archive and does not build it."
-  fi
+  printf '%s\n' "note: central/deploy.sh takes one host and no flags. It does not edit Caddy. If PUBLIC_INSTALL_URL is already set, that script may write it into the unit. This wrapper does not set PUBLIC_INSTALL_URL. The example value in the unit is https://example.invalid/install.sh."
   printf '%s\n' "# print-only; no files were changed and no installer was run"
   printf '%s\n' "check: id assistant-onboard"
   printf 'backup label=onboarding paths=%s units=%s\n' "$(IFS=,; printf '%s' "${paths[*]}")" "$(IFS=,; printf '%s' "${units[*]}")"

@@ -26,6 +26,9 @@ path_allowed() {
     /etc/systemd/system/assistant-restart@.service) return 0 ;;
     /etc/systemd/system/assistant-status.service) return 0 ;;
     /etc/systemd/system/assistant-status.timer) return 0 ;;
+    /etc/systemd/system/assistant-release@.service) return 0 ;;
+    /etc/systemd/system/assistant-release@.path) return 0 ;;
+    /var/lib/assistant-manager|/var/lib/assistant-manager/*) return 0 ;;
     /root/SETUP_LINK.txt) return 0 ;;
     *) return 1 ;;
   esac
@@ -86,9 +89,11 @@ onboard_port() {
 }
 
 # Print blockers for central/deploy.sh. Return 2 when the installer must not start.
+# The archive check matches the baseline script. After the onboarding pull request,
+# central/deploy.sh no longer mentions agent-template.tar.gz.
 onboard_blockers() {
   local unit="$1"
-  local archive="$2"
+  local deploy_sh="$2"
   local bind="" port=""
   local -a found=()
   bind="$(onboard_bind "$unit")"
@@ -102,8 +107,8 @@ onboard_blockers() {
   if [[ "$bind" == "192.0.2.1" ]]; then
     found+=("ONBOARD_BIND is the documentation placeholder 192.0.2.1 in the unit file. Replace it on the server checkout with the address Caddy can reach. Do not commit that edit. central/deploy.sh was not started.")
   fi
-  if [[ ! -f "$archive" ]]; then
-    found+=("tools/package.sh is not in this repository. central/deploy.sh requires ${archive} and its error text says to run tools/package.sh first. That script does not exist. This wrapper does not build the archive. central/deploy.sh was not started.")
+  if [[ -f "$deploy_sh" ]] && grep -q 'agent-template.tar.gz' "$deploy_sh"; then
+    found+=("This checkout's central/deploy.sh still requires agent-template.tar.gz. tools/package.sh is not in the repository. Apply the onboarding pull request before this runbook. central/deploy.sh was not started.")
   fi
   if ((${#found[@]} > 0)); then
     printf '%s\n' "${found[@]}" >&2
@@ -128,18 +133,18 @@ ubuntu_supported() {
 }
 
 rehearsal_env_set() {
-  [[ -n "${ASSISTANT_REHEARSE:-}${ASSISTANT_ROOT:-}${ASSISTANT_UNIT_FILE:-}${ASSISTANT_TEMPLATE_TAR:-}${ASSISTANT_OS_RELEASE:-}" ]]
+  [[ -n "${ASSISTANT_REHEARSE:-}${ASSISTANT_ROOT:-}${ASSISTANT_UNIT_FILE:-}${ASSISTANT_DEPLOY_SH:-}${ASSISTANT_OS_RELEASE:-}" ]]
 }
 
 refuse_rehearsal_on_apply() {
   if rehearsal_env_set; then
-    blocked "Unset ASSISTANT_REHEARSE, ASSISTANT_ROOT, ASSISTANT_UNIT_FILE, ASSISTANT_TEMPLATE_TAR, and ASSISTANT_OS_RELEASE before apply. The installer was not started."
+    blocked "Unset ASSISTANT_REHEARSE, ASSISTANT_ROOT, ASSISTANT_UNIT_FILE, ASSISTANT_DEPLOY_SH, and ASSISTANT_OS_RELEASE before apply. The installer was not started."
   fi
 }
 
 # Print-only reads overrides only when ASSISTANT_REHEARSE=1.
 refuse_partial_rehearsal() {
-  if [[ -z "${ASSISTANT_REHEARSE:-}" ]] && [[ -n "${ASSISTANT_ROOT:-}${ASSISTANT_UNIT_FILE:-}${ASSISTANT_TEMPLATE_TAR:-}${ASSISTANT_OS_RELEASE:-}" ]]; then
+  if [[ -z "${ASSISTANT_REHEARSE:-}" ]] && [[ -n "${ASSISTANT_ROOT:-}${ASSISTANT_UNIT_FILE:-}${ASSISTANT_DEPLOY_SH:-}${ASSISTANT_OS_RELEASE:-}" ]]; then
     blocked "Set ASSISTANT_REHEARSE=1 together with rehearsal paths, or unset them. Nothing was started."
   fi
 }
