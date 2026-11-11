@@ -48,7 +48,7 @@ sudo bash host/install-host.sh --onboard-host setup.<domain>
 המעבד בדרך כלל לא מהווה מגבלה, כי רוב הזמן הבוטים מחכים להודעות. העבודה הכבדה (המודל) רצה אצל OpenAI.
 
 ## ניתוק המפעיל
-`agentsctl release-access <שם>` רץ כ-root. הבוט עצמו מפעיל את אותו דבר בלי הרשאת root: הוא יוצר את הקובץ `/opt/agents/<שם>/.release-request`, ויחידת systemd מריצה את הפקודה עבור השם הזה בלבד.
+`agentsctl release-access <שם>` רץ כ-root. הבוט, בלי root, יוצר `.release-request` בתיקיית הבית שלו. יחידת systemd רואה את הקובץ בבית, וגם ב-`/opt/agents/<שם>/.release-request`, ומריצה את הפקודה עבור השם הזה בלבד.
 
 מפתח SSH של המפעיל צריך להופיע עם ההערה `assistant-operator` ועם שם הבוט. מפתח בלי ההערה הזו נשאר.
 

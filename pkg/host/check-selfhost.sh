@@ -268,4 +268,5 @@ if [ "$code" -ne 0 ]; then
   echo "container manager-hook assertion: fail (exit ${code})" >&2
   exit "$code"
 fi
-echo "container dry-run: pass (exit 0)"
+echo "container dry-run: pass"
+exit 0

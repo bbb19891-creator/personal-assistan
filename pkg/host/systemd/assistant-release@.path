@@ -1,7 +1,10 @@
 [Unit]
-Description=Assistant bot %i - release request from the tenant
+Description=Assistant bot %i - release request from the tenant home
 
 [Path]
+# The tenant user can create this file without root. The account home is the
+# tenant directory. PathExists catches the file when it first appears.
+PathExists=/opt/agents/%i/.release-request
 PathChanged=/opt/agents/%i/.release-request
 Unit=assistant-release@%i.service
 

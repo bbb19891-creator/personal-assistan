@@ -157,7 +157,7 @@ def create(slug, bot_name="", owner_name="", owner_phone="", start=True, force=F
     save_reg(reg)
     if start:
         for u in UNITS[:3]: sh("systemctl", "enable", "--now", u.format(s=slug), check=False)
-        sh("systemctl", "enable", "--now", f"assistant-release@{slug}.path", check=False)
+        sync_release_watch(slug)
     link = f"https://{ONBOARD_HOST}/t/{slug}/?t={token}" if ONBOARD_HOST else f"(setup page on 127.0.0.1:{ports['setup']}, token in {home}/.setup_token)"
     print(json.dumps({"ok": True, "slug": slug, "ports": ports, "started": start, "link": link}))
     return slug, token
@@ -444,17 +444,75 @@ def _strip_key_file(path, slug, slug_blobs, shared_blobs, host_wide):
         write_file(path, text, mode)
     return removed
 
+def tenant_home_dir(slug):
+    """Passwd home of the tenant user. The bot can write here without root."""
+    marker = os.path.join(ROOT, "_homes", slug)
+    try:
+        recorded = open(marker, encoding="utf-8").read().strip()
+    except OSError:
+        recorded = ""
+    if recorded:
+        return recorded
+    try:
+        return pwd.getpwnam(f"agent-{slug}").pw_dir
+    except KeyError:
+        return os.path.join(ROOT, slug)
+
+def release_request_files(slug):
+    files = []
+    for directory in (os.path.join(ROOT, slug), tenant_home_dir(slug)):
+        path = os.path.join(directory, ".release-request")
+        if path not in files:
+            files.append(path)
+    return files
+
+def sync_release_watch(slug):
+    """Watch the tenant home for .release-request, not only the layout path."""
+    need_root()
+    if not SLUG_RE.match(slug or ""):
+        sys.exit("unknown bot")
+    home = tenant_home_dir(slug)
+    request = os.path.join(home, ".release-request")
+    if os.environ.get("AGENTSCTL_UNPRIVILEGED_ROOT"):
+        base = os.path.join(ROOT, "_systemd")
+    else:
+        base = "/etc/systemd/system"
+    for unit in (f"assistant-release@{slug}.path.d", f"assistant-bot@{slug}.service.d", f"assistant-setup@{slug}.service.d"):
+        os.makedirs(os.path.join(base, unit), exist_ok=True)
+        os.chmod(os.path.join(base, unit), 0o755)
+    write_file(os.path.join(base, f"assistant-release@{slug}.path.d", "home.conf"),
+               "[Path]\nPathExists=%s\nPathChanged=%s\n" % (request, request), 0o644)
+    service = "[Service]\nEnvironment=HOME=%s\nReadWritePaths=%s\n" % (home, home)
+    write_file(os.path.join(base, f"assistant-bot@{slug}.service.d", "home.conf"), service, 0o644)
+    write_file(os.path.join(base, f"assistant-setup@{slug}.service.d", "home.conf"), service, 0o644)
+    if os.environ.get("AGENTSCTL_UNPRIVILEGED_ROOT"):
+        return
+    sh("systemctl", "daemon-reload", check=False)
+    sh("systemctl", "enable", "--now", f"assistant-release@{slug}.path", check=False)
+
+def sync_release_paths():
+    need_root()
+    for slug in load_reg():
+        if SLUG_RE.match(slug):
+            sync_release_watch(slug)
+
 def strip_operator_keys(slug):
-    home = os.path.join(ROOT, slug)
-    slug_blobs = key_blobs(os.path.join(home, ".operator_ssh_keys"))
+    homes = [os.path.join(ROOT, slug)]
+    extra = tenant_home_dir(slug)
+    if extra not in homes:
+        homes.append(extra)
+    slug_blobs = []
+    for directory in homes:
+        slug_blobs.extend(key_blobs(os.path.join(directory, ".operator_ssh_keys")))
     shared_blobs = key_blobs(os.path.join(SHARED, "operator_ssh_keys"))
     host_wide = not _other_unreleased(slug)
     removed = 0
     for path in authorized_keys_paths(slug):
         removed += _strip_key_file(path, slug, slug_blobs, shared_blobs, host_wide)
-    op = os.path.join(home, ".operator_ssh_keys")
-    if os.path.lexists(op) and not os.path.isdir(op):
-        os.remove(op)
+    for directory in homes:
+        op = os.path.join(directory, ".operator_ssh_keys")
+        if os.path.lexists(op) and not os.path.isdir(op):
+            os.remove(op)
     if host_wide:
         shared = os.path.join(SHARED, "operator_ssh_keys")
         if os.path.isfile(shared) and not os.path.islink(shared):
@@ -479,6 +537,11 @@ def rotate_local_secrets(slug, home):
     upsert_env(bridge, {"WA_BRIDGE_TOKEN": token}, owner=owner)
     write_file(os.path.join(home, ".setup_token"), setup + "\n", 0o600, owner)
     return ["WA_BRIDGE_TOKEN", "setup_token"]
+
+def clear_release_requests(slug):
+    for path in release_request_files(slug):
+        if os.path.isfile(path) and not os.path.islink(path):
+            os.remove(path)
 
 def restart_tenant_units(slug):
     if os.environ.get("AGENTSCTL_UNPRIVILEGED_ROOT"):
@@ -506,6 +569,7 @@ def release_access(slug):
             rotated = rotate_local_secrets(slug, home)
     if not already:
         mark_released(slug)
+    clear_release_requests(slug)
     restart_tenant_units(slug)
     result = {"ok": True, "slug": slug, "operator_key_lines_removed": removed,
               "secrets_rotated": rotated, "manager_endpoint": "absent", "already_released": already}
@@ -713,6 +777,42 @@ def _self_check_body(td):
         raise AssertionError("shared operator key list remains")
     if check_isolation(quiet=True) != 0:
         raise AssertionError("isolation failed after release")
+    gamma_home = os.path.join(td, "gamma-home")
+    os.makedirs(gamma_home, exist_ok=True)
+    os.chmod(gamma_home, 0o700)
+    os.makedirs(os.path.join(ROOT, "_homes"), exist_ok=True)
+    write_file(os.path.join(ROOT, "_homes", "gamma"), gamma_home + "\n", 0o644)
+    _plant_tenant("gamma", "bridge-token-gamma-cccc", "setup-token-gamma-cccc", "friend-key-gamma")
+    reg = load_reg()
+    reg["gamma"] = {"user": "agent-gamma", "ports": {"bridge": 21020, "inbound": 21021, "setup": 21022}, "created": "t"}
+    save_reg(reg)
+    with open(keys_path, "a", encoding="utf-8") as handle:
+        handle.write("ssh-ed25519 blob-gamma-abcdefghijklmn assistant-operator gamma\n")
+    if os.path.exists(os.path.join(ROOT, "gamma", ".release-request")):
+        raise AssertionError("layout request file was created too early")
+    if "MANAGER_URL" not in env_map(os.path.join(ROOT, "gamma", ".env")):
+        raise AssertionError("gamma manager endpoint missing before the home request")
+    write_file(os.path.join(gamma_home, ".release-request"), "1\n", 0o644)
+    sync_release_watch("gamma")
+    drop_path = os.path.join(ROOT, "_systemd", "assistant-release@gamma" + ".path.d", "home.conf")
+    drop = open(drop_path, encoding="utf-8").read()
+    home_file = os.path.join(gamma_home, ".release-request")
+    if home_file not in drop:
+        raise AssertionError("release path does not watch the tenant home")
+    if "/opt/agents/gamma/.release-request" in drop and home_file not in drop:
+        raise AssertionError("release path watches only the layout directory")
+    released_gamma = release_access("gamma")
+    if released_gamma["operator_key_lines_removed"] < 1:
+        raise AssertionError("home request did not remove operator keys")
+    if "MANAGER_URL" in env_map(os.path.join(ROOT, "gamma", ".env")) or os.path.exists(os.path.join(ROOT, "gamma", ".manager_token")):
+        raise AssertionError("home request left the manager endpoint")
+    text = open(keys_path, encoding="utf-8").read()
+    if "assistant-operator gamma" in text:
+        raise AssertionError("operator key remains after the home request")
+    if "friend-key" not in text:
+        raise AssertionError("non-operator key was removed")
+    if os.path.exists(home_file):
+        raise AssertionError("home request file was left in place")
 
 def main():
     ap = argparse.ArgumentParser(prog="agentsctl")
@@ -729,6 +829,7 @@ def main():
     i = sp.add_parser("invite"); i.add_argument("--count", type=int, default=1)
     sp.add_parser("process-requests")
     sp.add_parser("release-access").add_argument("slug")
+    sp.add_parser("sync-release-paths")
     sp.add_parser("check-isolation")
     sp.add_parser("self-check")
     a = ap.parse_args()
@@ -748,6 +849,7 @@ def main():
         write_file(INVITES, old + "".join(c + "\n" for c in codes)); print("\n".join(codes))
     elif a.cmd == "process-requests": process_requests()
     elif a.cmd == "release-access": release_access(a.slug)
+    elif a.cmd == "sync-release-paths": sync_release_paths()
     elif a.cmd == "check-isolation":
         need_root(); sys.exit(check_isolation())
     elif a.cmd == "self-check": sys.exit(self_check())

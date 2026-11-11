@@ -68,8 +68,12 @@ if [ "$DRY_RUN" = 1 ]; then
     echo "missing per-tenant release unit" >&2
     missing=1
   fi
-  if [ ! -f "$SRC/host/systemd/assistant-release@.path" ] || ! grep -q '/opt/agents/%i/.release-request' "$SRC/host/systemd/assistant-release@.path"; then
+  if [ ! -f "$SRC/host/systemd/assistant-release@.path" ] || ! grep -q 'PathExists=/opt/agents/%i/.release-request' "$SRC/host/systemd/assistant-release@.path"; then
     echo "missing per-tenant release path" >&2
+    missing=1
+  fi
+  if ! grep -q 'home.conf' "$SRC/host/agentsctl" || ! grep -q '.release-request' "$SRC/host/agentsctl"; then
+    echo "release path does not watch the tenant home" >&2
     missing=1
   fi
   leaked="$(find "$SRC" \( -name '.env' -o -name 'id_rsa' -o -name 'id_ed25519' -o -name '*.pem' \) -print)"
@@ -148,17 +152,7 @@ install -m 644 "$SRC"/host/systemd/assistant-* /etc/systemd/system/
 systemctl daemon-reload
 systemctl enable --now assistant-status.timer assistant-provision.path
 if [ -f "$R/registry.json" ]; then
-  python3 - "$R/registry.json" <<'PY'
-import json, re, subprocess, sys
-reg = json.load(open(sys.argv[1], encoding="utf-8"))
-if not isinstance(reg, dict):
-    raise SystemExit(0)
-ok = re.compile(r"^[a-z][a-z0-9-]{2,20}$")
-for slug in reg:
-    if not ok.fullmatch(str(slug)):
-        continue
-    subprocess.run(["systemctl", "enable", "--now", f"assistant-release@{slug}.path"], check=False)
-PY
+  /usr/local/sbin/agentsctl sync-release-paths
 fi
 /usr/local/sbin/agentsctl status --write >/dev/null || true
 printf '\n'
