@@ -19,6 +19,9 @@
 #   The linter and the rootless dry-run still run when no runtime answers.
 #   A missing runtime is a failed check: the script exits non-zero and does
 #   not call the container dry-run a pass.
+#   The guest runs as root and writes mode 600 files. Before the guest exits
+#   it gives that tree back to the user who started the check, so the same
+#   assertion can read it and the temporary directory can be removed.
 #
 # Exit status is non-zero when any check fails, including a missing runtime.
 set -euo pipefail
@@ -247,15 +250,24 @@ fi
 
 cout="$tmp/container"
 mkdir -p "$cout"
+touch "$cout/.owner-probe"
+# shellcheck disable=SC2016
+cat > "$cout/return-tree.sh" <<'EOF'
+bash /pkg/install.sh --dry-run --yes --render-dir /out
+status=$?
+chown --reference=/out/.owner-probe -R /out || status=$?
+exit "$status"
+EOF
 set +e
 "$runtime" run --rm --network=none \
   -v "$PKG_DIR:/pkg:ro" \
   -v "$cout:/out" \
   -e SELF_HOST=1 \
   "$image" \
-  bash /pkg/install.sh --dry-run --yes --render-dir /out
+  bash /out/return-tree.sh
 code=$?
 set -e
+rm -f "$cout/.owner-probe" "$cout/return-tree.sh"
 if [ "$code" -ne 0 ]; then
   echo "container dry-run: fail (exit ${code})" >&2
   exit "$code"
