@@ -13,14 +13,14 @@
 #   names. Manager hook assignments must be absent. SELF_HOST=1 must be set.
 #   The same assertion runs when a container runtime is available.
 #
-# Container dry-run:
-#   docker or podman, only when `info` succeeds.
-#   The guest runs the same install.sh --dry-run against a mounted tree.
-#   If neither runtime answers, this script still shellchecks and still runs
-#   the rootless dry-run. It prints "container dry-run: skipped" and does not
-#   call that a pass.
+# Container dry-run (required):
+#   docker or podman, when `info` succeeds, runs the same install.sh --dry-run
+#   inside ubuntu:24.04 against a mounted tree.
+#   The linter and the rootless dry-run still run when no runtime answers.
+#   A missing runtime is a failed check: the script exits non-zero and does
+#   not call the container dry-run a pass.
 #
-# Exit status is non-zero when any executed check fails.
+# Exit status is non-zero when any check fails, including a missing runtime.
 set -euo pipefail
 
 HOST_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -229,8 +229,8 @@ elif command -v podman >/dev/null 2>&1 && podman info >/dev/null 2>&1; then
 fi
 
 if [ -z "$runtime" ]; then
-  echo "container dry-run: skipped (no docker or podman)"
-  exit 0
+  echo "container dry-run: fail (no docker or podman)" >&2
+  exit 1
 fi
 
 image="ubuntu:24.04"

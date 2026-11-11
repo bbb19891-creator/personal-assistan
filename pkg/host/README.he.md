@@ -58,4 +58,4 @@ sudo bash host/install-host.sh --onboard-host setup.<domain>
 העברת הבעלות על השרת נעשית במסך של Hetzner, בלי מפתח. השלבים: `hetzner-transfer.md`.
 
 ## בדיקה בלי שרת
-`bash host/check-selfhost.sh` מריץ shellcheck, בדיקת בידוד, והרצה יבשה של `install.sh`. אם אין docker או podman, ההרצה היבשה רצה בלי קונטיינר ובלי root, ובודקת שביחידות שנוצרו אין חיבור למנהל.
+`bash host/check-selfhost.sh` מריץ shellcheck, בדיקת בידוד, והרצה יבשה של `install.sh`, ואז את אותה הרצה בתוך ubuntu עם docker או podman. בלי אחד מהם הבדיקה נכשלת.
