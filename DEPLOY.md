@@ -244,7 +244,7 @@ In a temporary checkout, not on a live server, these merges were run with `git m
 - `origin/cursor/bot-release-runtime-9c0b`
 - `origin/cursor/pilot-ledger-1078`
 
-A second `git merge --no-edit origin/cursor/pilot-ledger-1078` printed `Already up to date` and exited 0.
+A second `git merge --no-edit origin/cursor/pilot-ledger-1078` printed `Already up to date` and exited 0. Merging `cursor/deploy-runbook-a741` onto that same checkout completed with no conflict.
 
 On that assembled tree:
 

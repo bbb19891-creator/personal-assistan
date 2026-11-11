@@ -154,7 +154,14 @@ set -e
 grep -q 'not started' "$TMP/root.err" || fail "apply without root did not say the installer was not started"
 [[ "$onboard_status" -eq 2 ]] || fail "onboarding plan on the baseline tree should be blocked"
 grep -q '192.0.2.1' "$TMP/onboard.err" || fail "onboarding plan did not report the placeholder bind"
-grep -q 'agent-template.tar.gz' "$TMP/onboard.err" || fail "onboarding plan did not report the baseline archive requirement"
+deploy_file="$SCRIPT_DIR/../../central/deploy.sh"
+if grep -q 'agent-template.tar.gz' "$deploy_file"; then
+  grep -q 'agent-template.tar.gz' "$TMP/onboard.err" || fail "onboarding plan did not report the baseline archive requirement"
+else
+  if grep -q 'agent-template.tar.gz' "$TMP/onboard.err"; then
+    fail "onboarding plan reported an archive requirement this deploy.sh does not have"
+  fi
+fi
 if grep -q '^run:' "$TMP/onboard.out"; then
   fail "blocked onboarding plan still printed an installer command"
 fi
