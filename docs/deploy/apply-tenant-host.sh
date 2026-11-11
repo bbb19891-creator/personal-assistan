@@ -83,6 +83,8 @@ if [[ "$mode" == "shared" ]]; then
     /etc/systemd/system/assistant-restart@.service
     /etc/systemd/system/assistant-status.service
     /etc/systemd/system/assistant-status.timer
+    /etc/systemd/system/assistant-release@.service
+    /etc/systemd/system/assistant-release@.path
   )
   units=(assistant-status.timer assistant-provision.path assistant-provision.service)
   installer=(bash "$REPO_ROOT/pkg/host/install-host.sh")

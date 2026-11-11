@@ -1,103 +1,97 @@
 # Deploy
 
-Operator steps for the baseline installers in this repository. Replace `example.invalid` with the DNS name for that step (YOUR_HOST). Do not commit the real name, an address, a key, or a phone number.
+Apply the open pull requests in the order below, then use the wrappers in `docs/deploy/`. Replace `example.invalid` with the DNS name for that step (YOUR_HOST). Do not commit the real name, an address, a key, or a phone number.
 
-Commands are run from the repository root on the server. Copy the repository onto the server without putting a credential on the command line. The clone URL is not written here.
-
-This file is a list of steps to run. It is not a report that they succeeded on a live server. The last section says what was executed in this change.
-
-Exit code 2 from a wrapper means the installer was not started. Any other non-zero code means the installer ran and may already have changed files. Use the archive path the wrapper printed.
+This file is a list of steps to run. It is not a report that a live install, a Caddy reload, or `systemctl enable` succeeded. The last section lists the commands that were actually run.
 
 ## Human-only steps
 
-Nothing in this repository does these. Do not treat them as part of `install-host.sh`, `deploy.sh`, or `install.sh`.
+Nothing in this repository does these.
 
-### Temporary 019 lines
+- Buy one temporary line per friend from 019. No script buys a line or sends a WhatsApp message.
+- In the OpenAI account, create one key per friend and set a hard usage cap of 20 USD. `pkg/.env.example` contains `COST_CEILING_USD=30`. That example field is not the provider cap.
+- Move the server in the Hetzner console. After the host pull request, the click-path in `pkg/host/hetzner-transfer.md` is: open the friend's project, choose Security, open Members, choose Add member, and invite the current project owner. The current owner accepts, opens the project that holds the server, opens the server, chooses Transfer to Project, and confirms the friend's project. No script calls a Hetzner API for this. Do not paste a friend's API token. The host and dedicated installers refuse `--hetzner-token`, `--hcloud-token`, and `--api-token`.
 
-Buy one temporary line per friend from 019. No script buys a line, stores a number, or sends a WhatsApp message. Pairing stays on the setup page after install. This runbook does not change bridge pairing.
+DNS, the bind edit, `PUBLIC_INSTALL_URL`, the Caddy paste, and a cloud-init paste are also hand steps.
 
-### OpenAI keys, 20 USD hard cap
+## 1. Assemble the checkout
 
-In the OpenAI account, create one key per friend and set a hard usage cap of 20 USD on that key. No script creates a key or sets that provider cap.
+Start from a clean checkout of the baseline branch `cursor/import-baseline-secret-scan-9b4c`. Copy the repository onto the server without putting a credential on the command line.
 
-`pkg/.env.example` contains `COST_CEILING_USD=30`. That is a bot-side example field. It is not the provider hard cap, and it is not a stand-in for the 20 USD cap.
+Before each merge, keep the current commit:
 
-### Hetzner project transfer
+```bash
+git branch "backup-$(date -u +%Y%m%dT%H%M%SZ)"
+```
 
-Do this in the Hetzner Cloud console:
+Repeating that creates another backup branch and does not change files. To undo one merge that has not been shared, and only when the work tree is clean:
 
-1. The friend invites the current project owner as a member of the friend's project.
-2. The current owner uses Transfer to Project to move the server into the friend's project.
+```bash
+git merge --abort
+git reset --hard BACKUP-BRANCH
+```
 
-No script calls a Hetzner API for this. Do not paste a friend's API token. `central/onboard.py` still has a page at `/own-server` that asks for a token. That page is not this transfer. This runbook does not use it.
+`git merge --abort` applies only while a merge is in progress. `git reset --hard` discards uncommitted work. Do not use it on a dirty tree.
 
-### Also done by hand
+Merge in this order. A second merge of a branch that is already contained exits 0 and prints `Already up to date`.
 
-- Create the DNS record for the onboarding name.
-- Replace the bind placeholder in the unit file on the server checkout.
-- Place `agent-template.tar.gz` (the packager is not in this tree; see below).
-- Add the Caddy site block and reload Caddy.
-- Paste cloud-init into the Hetzner create-server form, if you use that path.
-- Pair WhatsApp on the setup page.
+```bash
+git merge --no-edit origin/cursor/security-qa-ci-5f37
+git merge --no-edit origin/cursor/host-selfhost-isolation-1e28
+git merge --no-edit origin/cursor/onboarding-own-server-support-4d16
+git merge --no-edit origin/cursor/bot-release-runtime-9c0b
+git merge --no-edit origin/cursor/pilot-ledger-1078
+git merge --no-edit origin/cursor/deploy-runbook-a741
+```
 
-## Scripts that are not in this repository
+That is baseline, pull request 2, pull request 5, pull request 6, pull request 4, pull request 7, then this runbook. These branches do not share edited files, so the merges do not need conflict resolution. Do not merge them to the default branch from this runbook.
 
-`central/deploy.sh` exits unless `<repo>/agent-template.tar.gz` exists. Its message says to run `tools/package.sh` first. `tools/package.sh` is not in this repository. This runbook does not invent that script or any flags for it.
+## 2. Pull request 2, tests only
 
-The installer that does exist for a server is `pkg/install.sh`. `central/deploy.sh` only copies whatever file you placed at `<repo>/agent-template.tar.gz`. `central/onboard.py` serves that file. The cloud-init text in `central/onboard.py` and in `pkg/deploy/cloud-init.yaml` unpacks an archive and runs `install.sh` from the unpacked directory. This change did not build an archive and does not check that an archive is valid. It only checks that the file is present before it will call `deploy.sh`.
+`.github/workflows/tests.yml` runs `bash .github/scripts/run-area-tests.sh` in CI. That script runs pytest in directories that exist and, when `pkg/host/check-selfhost.sh` exists, runs that too. It does not install the assistant and it does not replace the secrets workflow.
 
-`PUBLIC_INSTALL_URL` is not read by the baseline onboarding code. Do not add a curl command that contains an account name.
+On the assembled tree:
 
-`platform/assistant_manager.py` is not part of this runbook. Its usage line is `serve|provision|tick|render`. No installer here wraps it. This change did not start it.
+```bash
+python3 -m pip install --disable-pip-version-check pytest==9.2.0
+bash .github/scripts/run-area-tests.sh
+```
 
-## Wrappers
+There is nothing to roll back on the server. The script does not enable a service.
 
-| Script | What it calls |
-| --- | --- |
-| `docs/deploy/apply-tenant-host.sh shared` | `pkg/host/install-host.sh`, and `--onboard-host` only when you pass it |
-| `docs/deploy/apply-onboarding-host.sh` | `central/deploy.sh HOST` with no flags |
-| `docs/deploy/apply-tenant-host.sh dedicated` | `pkg/install.sh --yes --domain HOST`, and `--restore FILE` only when you pass it |
-| `docs/deploy/print-caddy-snippet.sh` | the same `sed` replacement as `central/deploy.sh`; it does not edit Caddy |
-| `docs/deploy/backup.sh` | nothing; it copies allowlisted paths into a new archive |
-| `docs/deploy/rollback.sh` | nothing; it restores one archive |
+## 3. Pull request 5, host and one dedicated server
 
-`--print-only` prints the installer command and does not take a backup. Repeating an apply script takes a new backup, then runs the same installer command again. Repeating `backup.sh` writes another archive and does not change the live paths. Repeating `rollback.sh` on the same archive restores the same files. That repeat was tested in a temporary directory by `docs/deploy/self-check.sh`, not on a live server.
+`pkg/host/install-host.sh` still accepts only `--onboard-host` for a real run. It also accepts `--dry-run`, which does not install packages and does not need root. It refuses an API token flag.
 
-`rollback.sh` restores only paths on its allowlist (`path_allowed` in `docs/deploy/lib.sh`). It does not call `systemctl`, delete users, uninstall packages, or change the firewall.
+`pkg/install.sh` still accepts `--yes`, `-y`, `--setup-token`, `--domain`, and `--restore`. It also accepts `--dry-run` and `--render-dir`. `SELF_HOST` defaults to 1. Any other value makes the script exit. It refuses an API token flag.
 
-On the live server, leave these unset: `ASSISTANT_REHEARSE`, `ASSISTANT_ROOT`, `ASSISTANT_UNIT_FILE`, `ASSISTANT_TEMPLATE_TAR`, `ASSISTANT_OS_RELEASE`. Apply mode exits 2 if any of them is set. `ASSISTANT_BACKUP_DIR` may be set when you want archives somewhere other than `/var/backups/assistant-deploy`.
+Check the tree before a root install:
 
-Archives are mode `600`. They can contain copies of environment files. Leave them on the server. Do not commit them.
+```bash
+bash pkg/host/install-host.sh --dry-run
+bash pkg/install.sh --dry-run --yes --render-dir /tmp/assistant-selfhost-proof
+python3 pkg/host/agentsctl self-check
+bash pkg/host/check-selfhost.sh
+```
 
-## 1. Shared tenant host
+`check-selfhost.sh` exits non-zero when docker and podman are both missing. That is a failed check, not a pass. The shell linter and the rootless dry-run still run before that failure.
 
-`pkg/host/install-host.sh` prepares one machine for isolated assistants. In this baseline, `central/deploy.sh` is installed on that same machine: it requires the user `assistant-onboard`, which `install-host.sh` creates. A dedicated server for one friend is section 3, and it does not use `install-host.sh`.
-
-The only flag `install-host.sh` accepts is `--onboard-host`.
-
-See the command without changing the machine:
+The real shared-host command is unchanged. The wrapper backs up the previous files, including the release units this pull request adds, then runs the installer:
 
 ```bash
 bash docs/deploy/apply-tenant-host.sh shared --onboard-host example.invalid --print-only
-```
-
-Apply it:
-
-```bash
 sudo bash docs/deploy/apply-tenant-host.sh shared --onboard-host example.invalid
 ```
 
-The wrapper's installer command is:
+The installer command inside the wrapper is:
 
 ```bash
 sudo bash pkg/host/install-host.sh --onboard-host example.invalid
 ```
 
-The script header says it does not start a bot and does not edit Caddy. It installs distro packages when `node`, `python3` venv, `pdftotext`, or `sqlite3` is missing, and it exits if `node` exists and is older than 20. This change did not run it and did not run apt.
+That script's header says a re-run refreshes shared code and unit files and keeps tenant homes, `registry.json`, invite codes, and per-tenant secrets. It copies `pkg/host/systemd/assistant-*`, which includes `assistant-release@.service` and `assistant-release@.path` after this pull request. It runs `systemctl enable --now` for `assistant-status.timer` and `assistant-provision.path`. This runbook does not claim that enable succeeded. The wrapper does not pass `--dry-run` on this path.
 
-If it prints `refusing: /etc/systemd/system/assistant-bot@.service exists and is not ours` (or the same sentence for `assistant-bridge@` or `assistant-setup@`), stop. Do not delete that unit from this runbook.
-
-The wrapper prints an archive path. To put the files back:
+File rollback, using the archive path the wrapper prints:
 
 ```bash
 sudo bash docs/deploy/rollback.sh /var/backups/assistant-deploy/ARCHIVE.tar.gz
@@ -105,13 +99,9 @@ sudo systemctl daemon-reload
 sudo systemctl stop assistant-status.timer assistant-provision.path assistant-provision.service
 ```
 
-Run those `systemctl` commands yourself. `rollback.sh` does not run them. This change did not run them. Rollback does not delete the user `assistant-onboard` and does not uninstall packages. Do not restore an older archive after a later change you want to keep.
+Run the `systemctl` lines yourself. `rollback.sh` does not run them, does not delete the user `assistant-onboard`, and does not uninstall packages.
 
-### One assistant on that host
-
-Subcommands that exist in `pkg/host/agentsctl`: `create`, `list`, `start`, `stop`, `restart`, `delete`, `link`, `status`, `capacity`, `export`, `invite`, `process-requests`.
-
-`create` accepts `SLUG` and the flags `--bot-name`, `--owner-name`, `--owner-phone`, `--no-start`, and `--force`. This runbook uses the slug and `--bot-name` only. Do not put `--owner-phone` in a saved command. `--force` exists and skips the capacity refusal; do not use it here.
+`agentsctl` gains `release-access SLUG`, `check-isolation`, and `self-check`. The other subcommands are unchanged: `create`, `list`, `start`, `stop`, `restart`, `delete`, `link`, `status`, `capacity`, `export`, `invite`, `process-requests`. `create` still accepts `--bot-name`, `--owner-name`, `--owner-phone`, `--no-start`, and `--force`. Do not put `--owner-phone` in a saved command. Do not use `--force` here. Creating a bot enables the release path unit for that slug inside `agentsctl`. This runbook does not claim that enable succeeded.
 
 ```bash
 sudo /usr/local/sbin/agentsctl capacity
@@ -119,29 +109,40 @@ sudo /usr/local/sbin/agentsctl create friend-one --bot-name assistant
 sudo /usr/local/sbin/agentsctl list
 ```
 
-The slug must be 3 to 21 characters, start with a letter, and use only `a-z`, digits, and hyphens. `create` exits if that slug already exists. If it does, stop and use `list`. Do not create it again.
-
-To undo that create, the existing command is:
+`create` exits if the slug already exists. To undo that create:
 
 ```bash
 sudo /usr/local/sbin/agentsctl delete friend-one --yes
 ```
 
-`delete` requires `--yes`. Without `--purge` it archives the directory under `/opt/agents/_archive`. `--purge` exists; this runbook does not use it. This change did not run `agentsctl`.
+`--purge` exists. Do not pass it here. `delete` archives under `/opt/agents/_archive` unless `--purge` is also present.
 
-`invite --count 1` prints an invite code. That code is a secret. Do not commit it. This change did not generate one.
+One dedicated server is still:
 
-## 2. Onboarding host
+```bash
+bash docs/deploy/apply-tenant-host.sh dedicated --domain example.invalid --print-only
+sudo bash docs/deploy/apply-tenant-host.sh dedicated --domain example.invalid
+```
 
-Do this on the same machine, after section 1. `central/deploy.sh` takes one positional host and no flags. It does not edit Caddy. It copies `central/agent-onboarding.service` after replacing `__ONBOARD_HOST__`, enables `agent-onboarding`, and requests `http://<bind>:<port>/health`.
+The installer command is `sudo bash pkg/install.sh --yes --domain example.invalid`. The wrapper does not accept `--setup-token` or `--dry-run`. `--restore FILE` is passed through when you set it. Do not point `--restore` at a file inside `/opt/agent`.
 
-### 2a. Replace the bind placeholder
+`pkg/deploy/cloud-init.yaml` is still a paste into the Hetzner create-server form. Replace `__PKG_URL__` with an `https` URL that does not contain an account name. The placeholder is `https://example.invalid/agent.tar.gz`. Replace `__SETUP_TOKEN__` on the server, not in git:
 
-The unit ships with `ONBOARD_BIND=192.0.2.1` and `ONBOARD_PORT=8840`. `192.0.2.1` is a documentation placeholder. `deploy.sh` refuses `0.0.0.0`. It does not replace `192.0.2.1`. Leave `ONBOARD_PORT` as shipped unless `deploy.sh` exits because that port is in use. This runbook does not choose a different port.
+```bash
+head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32
+```
 
-On the server checkout, not in git, set `ONBOARD_BIND` to an address Caddy can use to reach the service. The comment in `central/onboard.py` says the process binds on `127.0.0.1` when Caddy is on the host. The unit comment says to use the docker bridge address when Caddy runs in Docker. This change did not discover that address.
+The yaml runs `SELF_HOST=1 bash .../install.sh --yes --setup-token ...`. No script submits that file.
 
-Back up the unit before editing it. This path is the checkout, so it is not in the wrapper allowlist:
+Move one bot with the existing commands `agentsctl stop`, `agentsctl export`, and `install.sh --restore`. The export contains secrets. Do not commit it.
+
+## 4. Pull request 6, onboarding
+
+`central/deploy.sh` no longer looks for `agent-template.tar.gz`. `tools/package.sh` is still not in the repository. The baseline copy of `deploy.sh`, before this pull request, does require that archive and names `tools/package.sh`. The onboarding wrapper refuses to start while the checkout's `deploy.sh` still contains `agent-template.tar.gz`.
+
+`deploy.sh` still takes one host and no flags. It does not edit Caddy. If `PUBLIC_INSTALL_URL` is set, it must be an `https` URL whose path ends in `/install.sh`. The unit ships `PUBLIC_INSTALL_URL=https://example.invalid/install.sh`. The wrapper does not set the variable. Export the real URL in the server shell before apply, and do not commit it. If the variable is unset, `deploy.sh` leaves the example value in the unit.
+
+`ONBOARD_BIND=192.0.2.1` and `ONBOARD_PORT=8840` are still the shipped examples. `deploy.sh` refuses `0.0.0.0`. The wrapper also refuses the placeholder `192.0.2.1`. Edit the unit on the server checkout only. Back it up first:
 
 ```bash
 stamp="$(date -u +%Y%m%dT%H%M%SZ)"
@@ -149,182 +150,113 @@ mkdir -p "$HOME/assistant-deploy-notes"
 cp -a central/agent-onboarding.service "$HOME/assistant-deploy-notes/agent-onboarding.service.$stamp"
 ```
 
-Repeating that uses a new stamp and does not overwrite the previous copy. To undo the edit:
+To undo that edit:
 
 ```bash
 cp -a "$HOME/assistant-deploy-notes/agent-onboarding.service.$stamp" central/agent-onboarding.service
 ```
 
-Do not commit the edited unit.
-
-### 2b. Archive file
-
-Put the package archive at `<repo>/agent-template.tar.gz` if you have one. If the file is missing, the wrapper exits 2 and does not call `deploy.sh`. There is no `tools/package.sh` to run.
-
-### 2c. Plan, then apply
+Then:
 
 ```bash
 bash docs/deploy/apply-onboarding-host.sh --host example.invalid --print-only
-```
-
-On an unedited checkout this exits 2. That is the preflight. It must not print a `run:` line.
-
-After the bind is no longer `192.0.2.1` or `0.0.0.0`, the port line is present, and the archive file exists:
-
-```bash
 sudo bash docs/deploy/apply-onboarding-host.sh --host example.invalid
 ```
 
-The installer command is:
+The installer command is `sudo bash central/deploy.sh example.invalid`. It enables and restarts `agent-onboarding` before its health request. This runbook does not claim that enable, that restart, or that health request succeeded. If the script exits after copying files, roll back the archive it printed, then:
 
 ```bash
-sudo bash central/deploy.sh example.invalid
-```
-
-The wrapper also requires the user `assistant-onboard`. If that user is missing it exits 2 before the backup.
-
-`deploy.sh` copies files and enables the unit before the health request. If that request fails, the script exits because of `set -e`, and it may exit before printing the Caddy block. Roll back the archive the wrapper printed, then reload systemd yourself:
-
-```bash
-sudo bash docs/deploy/rollback.sh /var/backups/assistant-deploy/ARCHIVE.tar.gz
 sudo systemctl stop agent-onboarding
 sudo systemctl daemon-reload
 ```
 
-This change did not run `deploy.sh` and did not run those `systemctl` commands. Re-running the wrapper takes a new backup and runs `deploy.sh` again. Whether that is safe to repeat is what the script does (copy files, restart the unit). It was not repeated here.
+Those two lines were not run here.
 
-### 2d. Caddy, by hand
-
-`deploy.sh` does not edit Caddy. Print the block:
+Print the Caddy block. The script substitutes `__ONBOARD_HOST__`, `__ONBOARD_BIND__`, and `__ONBOARD_PORT__` the same way `deploy.sh` does after this pull request. It does not edit Caddy.
 
 ```bash
 bash docs/deploy/print-caddy-snippet.sh --host example.invalid
 ```
 
-The printed block still contains `192.0.2.1`. Replace that address with the bind you set in the unit. The port in the shipped unit is `8840`. If the host is already in the Caddy file, do not add a second block:
-
-```bash
-grep -F -n -e 'example.invalid' /path/to/Caddyfile
-```
-
-Two files describe the reload, and they do not match:
-
-- `central/Caddyfile.snippet` says Caddy runs in Docker, names the container `n8n-setup-caddy-1`, and gives this command:
-
-```bash
-docker exec n8n-setup-caddy-1 caddy validate --config /etc/caddy/Caddyfile && docker exec n8n-setup-caddy-1 caddy reload --config /etc/caddy/Caddyfile
-```
-
-- `central/README.he.md` says to add the block to `/etc/caddy/Caddyfile`, then run `caddy validate` and `systemctl reload caddy`.
-
-Before editing, see which Caddy is running (`systemctl is-active caddy`, and `docker ps`). This change did not run either command on the live server. If `docker ps` does not show `n8n-setup-caddy-1`, do not invent another container name. Back up the file that is actually in use, then validate with the command that matches that Caddy. If validate fails, do not reload.
-
-Backup before the edit. For a host file:
+If the host is already in the Caddy file, do not add a second block. Backup the file you will edit:
 
 ```bash
 sudo bash docs/deploy/backup.sh onboarding-caddy --path /etc/caddy/Caddyfile
 ```
 
-For the container named in the snippet, only after `docker ps` shows that exact name:
+After this pull request, `central/Caddyfile.snippet` says to validate and reload with `CADDY_CONTAINER` set (its example name is `caddy`):
 
 ```bash
-sudo mkdir -p /var/backups/assistant-deploy
-sudo docker cp n8n-setup-caddy-1:/etc/caddy/Caddyfile /var/backups/assistant-deploy/Caddyfile.pre-edit
+docker exec "$CADDY_CONTAINER" caddy validate --config /etc/caddy/Caddyfile && docker exec "$CADDY_CONTAINER" caddy reload --config /etc/caddy/Caddyfile
 ```
 
-To undo a host-file edit, restore the archive from `backup.sh`. To undo the docker copy, `docker cp` the saved file back, then validate again. This change did not reload Caddy.
+`central/README.he.md` still says `caddy validate` and `systemctl reload caddy`. Use the command that matches the Caddy you find. If validate fails, do not reload. Restore the `onboarding-caddy` archive. This was not run. Do not restore an earlier onboarding archive after the Caddy edit, or the Caddy file from before the edit comes back.
 
-The onboarding apply backup also includes `/etc/caddy/Caddyfile` from before `deploy.sh`. Do not restore that earlier archive after you have edited Caddy, or you will put the old file back. Use the archive from the backup you took immediately before the edit.
+## 5. Pull request 4, release runtime
 
-## 3. One dedicated server
+There is no new installer and no new flag. `pkg/host/install-host.sh` copies `pkg/agent/*.py` into the shared code directory when it is actually run. `pkg/install.sh` copies the same tree on a dedicated server. Re-running the wrapper from section 3 after this pull request is how that code is installed. That re-run was not done here.
 
-A different machine. `pkg/install.sh` asks for Ubuntu 22.04 or 24.04. Pick one path. Do not run both on the same new server.
+`assistant-release@.path` starts `agentsctl release-access SLUG` when a tenant writes its release request. `release-access` is the subcommand from pull request 5. Do not run it against a live slug from this runbook. `agentsctl self-check` exercises it in a temporary directory only.
 
-### 3a. SSH and `pkg/install.sh`
+## 6. Pull request 7, pilot ledger
 
-`pkg/deploy/` holds `Caddyfile.tmpl`, `agentctl`, the `assistant-*.service` units, and `cloud-init.yaml`. `pkg/install.sh` is the installer that uses those files.
+`platform/assistant_manager.py` accepts only `serve`, `provision`, `tick`, and `render`. `AM_DATA` is required. A path whose second component is `root` is rejected. There is no unit file in this pull request. Do not invent a `systemctl enable` for it.
+
+Use `/var/lib/assistant-manager` unless you have another path outside `/root`. Back up before the first write:
 
 ```bash
-bash docs/deploy/apply-tenant-host.sh dedicated --domain example.invalid --print-only
-sudo bash docs/deploy/apply-tenant-host.sh dedicated --domain example.invalid
+sudo mkdir -p /var/lib/assistant-manager
+sudo bash docs/deploy/backup.sh manager --path /var/lib/assistant-manager
 ```
 
-The installer command is:
+Set the origin yourself. The placeholder is `https://example.invalid`. `AM_BIND_PROXY` ships as `192.0.2.1`. Replace it before `serve`. `AM_DRY_RUN=1` is the switch that keeps the WhatsApp alert path from sending.
 
 ```bash
-sudo bash pkg/install.sh --yes --domain example.invalid
+sudo AM_DATA=/var/lib/assistant-manager AM_DRY_RUN=1 AM_PUBLIC_ORIGIN=https://example.invalid AM_BIND_PROXY=127.0.0.1 python3 platform/assistant_manager.py render
 ```
 
-Flags that exist on `pkg/install.sh` and that the wrapper does not accept: `--setup-token` and `-y`. `--setup-token` is a secret. Do not put it on a command line you save. The wrapper always passes `--yes`, which skips the question `Install the assistant into /opt/agent ?`. Before it calls `install.sh`, the wrapper refuses an OS other than 22.04 or 24.04. `--print-only` does not perform that OS check. Passing `--yes` straight to `install.sh` does not refuse a different OS; it only skips that exit. Use the wrapper.
+`render` writes the page to stdout and creates files under `AM_DATA`. `serve` binds a port and was not run. `provision` and `tick` were not run. To undo the data directory, restore the `manager` archive. That removes files the backup recorded, including a directory that was absent when the backup was taken.
 
-`--domain` is required here so the wrapper does not use the path in `pkg/install.sh` that looks up a public address when `--domain` is omitted. This change did not execute that path.
+## 7. Wrappers
 
-`install.sh` replaces `/etc/caddy/Caddyfile` from `pkg/deploy/Caddyfile.tmpl` (`127.0.0.1:8790` in the template). The script header says a re-run keeps `.env`, `data/`, WhatsApp auth, and Google tokens. It also enables ufw for ports 22, 80, and 443, and it installs Node from the NodeSource setup script and Caddy from the Cloudsmith list when those commands are missing. This change did not run any of that. The wrapper backs up `/etc/caddy/Caddyfile` before each run. Re-running still rewrites the Caddyfile from the template.
+| Script | What it calls |
+| --- | --- |
+| `docs/deploy/apply-tenant-host.sh shared` | `pkg/host/install-host.sh`, and `--onboard-host` only when you pass it |
+| `docs/deploy/apply-onboarding-host.sh` | `central/deploy.sh HOST` with no flags, after the pull request 6 copy of that script is in the tree |
+| `docs/deploy/apply-tenant-host.sh dedicated` | `pkg/install.sh --yes --domain HOST`, and `--restore FILE` only when you pass it |
+| `docs/deploy/print-caddy-snippet.sh` | the same host, bind, and port substitution `central/deploy.sh` prints; it does not edit Caddy |
+| `docs/deploy/backup.sh` | copies allowlisted paths into a new archive |
+| `docs/deploy/rollback.sh` | restores one archive |
 
-File rollback:
+`--print-only` prints the command and does not take a backup. Repeating an apply takes a new backup, then runs the same installer command. Repeating `rollback.sh` on the same archive restores the same files. That repeat was tested in a temporary directory by `docs/deploy/self-check.sh`, not on a live server.
 
-```bash
-sudo systemctl stop assistant-bridge assistant-setup assistant-bot
-sudo bash docs/deploy/rollback.sh /var/backups/assistant-deploy/ARCHIVE.tar.gz
-sudo systemctl daemon-reload
-```
+`rollback.sh` does not call `systemctl`, delete users, uninstall packages, or change the firewall. Archives are mode `600`. Leave them on the server.
 
-This does not stop `caddy` and does not revert ufw. After the Caddyfile is restored, validate and reload the Caddy that `install.sh` would have installed, using the reload that matches that install. This change did not install Caddy and did not run these `systemctl` commands.
+On the live server, leave these unset: `ASSISTANT_REHEARSE`, `ASSISTANT_ROOT`, `ASSISTANT_UNIT_FILE`, `ASSISTANT_DEPLOY_SH`, `ASSISTANT_OS_RELEASE`. `ASSISTANT_BACKUP_DIR` may point somewhere other than `/var/backups/assistant-deploy`.
 
-The setup link is written to `/root/SETUP_LINK.txt`. That file is a secret. `pkg/deploy/agentctl` accepts `link`, `new-link`, `status`, `logs`, `restart`, and `update`. This change did not run `agentctl`.
+## Executed for this update
 
-### 3b. Cloud-init paste
+In a temporary checkout, not on a live server, these merges were run with `git merge --no-edit` and finished without a conflict:
 
-`pkg/deploy/cloud-init.yaml` is the baseline file. No script submits it to Hetzner.
+- `origin/cursor/security-qa-ci-5f37` (fast-forward)
+- `origin/cursor/host-selfhost-isolation-1e28`
+- `origin/cursor/onboarding-own-server-support-4d16`
+- `origin/cursor/bot-release-runtime-9c0b`
+- `origin/cursor/pilot-ledger-1078`
 
-1. Copy the file outside the repository.
-2. Replace `__PKG_URL__` with the package URL. The placeholder is `https://example.invalid/agent.tar.gz`. Keep the real URL on the server copy. Do not embed an account name.
-3. Replace `__SETUP_TOKEN__` with a secret you generate on the server. Do not save the value in git, in a pull request, or in chat:
+A second `git merge --no-edit origin/cursor/pilot-ledger-1078` printed `Already up to date` and exited 0.
 
-```bash
-head -c 48 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32
-```
+On that assembled tree:
 
-That pipeline is the `rnd` helper in `pkg/install.sh`. This change did not run it.
+| Command | Result |
+| --- | --- |
+| `bash pkg/host/install-host.sh --dry-run` | exit 0, `install-host dry-run: ok` |
+| `bash pkg/install.sh --dry-run --yes --render-dir /tmp/assistant-selfhost-proof` | exit 0, `dry-run rendered: /tmp/assistant-selfhost-proof` |
+| `python3 pkg/host/agentsctl self-check` | exit 0, `self-check: ok` |
+| `bash pkg/host/check-selfhost.sh` | exit 1, `container dry-run: fail (no docker or podman)` |
+| `python3 -m pip install --disable-pip-version-check pytest==9.2.0` then `bash .github/scripts/run-area-tests.sh` | pytest passed in `pkg/agent/tests` (21), `central/tests` (16), `platform/tests` (18), and `tests` (9). The script then ran `check-selfhost.sh` and exited 1 for the same missing container runtime |
+| `AM_DATA=/tmp/am-data-proof AM_DRY_RUN=1 AM_PUBLIC_ORIGIN=https://example.invalid AM_AGENTS_ROOT=/tmp/am-agents-proof python3 platform/assistant_manager.py render` | exit 0, HTML on stdout |
 
-4. In Hetzner Cloud, create the server with Ubuntu 24.04 and paste the edited file into Cloud config. That is a click, not a script.
+`docs/deploy/self-check.sh` is the wrapper test on this runbook branch. It does not run the installers.
 
-The yaml runs `install.sh --yes --setup-token` from the unpacked archive. There is still no packager in this repository for that archive.
-
-### Move one assistant off the shared host
-
-```bash
-sudo /usr/local/sbin/agentsctl stop friend-one
-sudo /usr/local/sbin/agentsctl export friend-one /var/backups/assistant-deploy/friend-one.tar.gz
-```
-
-The export contains secrets. Do not commit it. `export` tells you to stop the bot on the old host before starting it on the new one. This change did not export a bot.
-
-On the new server:
-
-```bash
-sudo bash docs/deploy/apply-tenant-host.sh dedicated --domain example.invalid --restore /var/backups/assistant-deploy/friend-one.tar.gz
-```
-
-`--restore` is an existing `pkg/install.sh` flag. The wrapper passes it through. `install.sh` refuses the restore when `/opt/agent/data/memory.db` already exists. This change did not run a restore.
-
-## Executed in this change
-
-Executed on a checkout, not on a live server:
-
-- `bash docs/deploy/self-check.sh` (backup and rollback against a temporary directory, preflight refusals, `--print-only` plans, shellcheck)
-- `python3 scripts/secret_scan.py` and gitleaks, the same pair the secrets workflow runs
-
-Not executed:
-
-- `pkg/host/install-host.sh`
-- `central/deploy.sh`
-- `pkg/install.sh`
-- `pkg/deploy/cloud-init.yaml`
-- Caddy validate or reload
-- `docker ps` or `systemctl` on the live server
-- `agentsctl` and `agentctl`
-- the Hetzner console, including Transfer to Project
-- buying a 019 line
-- creating an OpenAI key or setting the 20 USD cap
-- the health request inside `deploy.sh`
+Not executed: `install-host.sh` without `--dry-run`, `install.sh` without `--dry-run`, `central/deploy.sh`, Caddy validate or reload, `systemctl`, `docker`, `agentsctl` against `/opt/agents`, `agentctl`, `assistant_manager.py serve`, `provision`, or `tick`, the Hetzner console, a 019 purchase, and OpenAI key creation. No live `/opt` or `/etc` path was changed.

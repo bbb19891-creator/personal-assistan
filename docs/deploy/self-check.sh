@@ -110,6 +110,14 @@ set -e
 [[ "$roll_status" -ne 0 ]] || fail "malicious archive was restored"
 grep -q 'safe' "$canary" || fail "canary was overwritten"
 
+release_archive="$(bash "$SCRIPT_DIR/backup.sh" release-unit \
+  --path /etc/systemd/system/assistant-release@.service \
+  --path /var/lib/assistant-manager)"
+manifest="$(tar -xOf "$release_archive" manifest.tsv)"
+printf '%s\n' "$manifest" | grep -F -q '/etc/systemd/system/assistant-release@.service' || fail "release unit was not recorded"
+printf '%s\n' "$manifest" | grep -F -q '/var/lib/assistant-manager' || fail "manager data dir was not recorded"
+printf '%s\n' "$manifest" | grep -F -q 'absent' || fail "new paths were not recorded as absent"
+
 unset ASSISTANT_ROOT
 plan="$(bash "$SCRIPT_DIR/apply-tenant-host.sh" shared --onboard-host example.invalid --print-only)"
 printf '%s\n' "$plan" | grep -q 'pkg/host/install-host.sh' || fail "shared plan missed install-host.sh"
@@ -146,7 +154,7 @@ set -e
 grep -q 'not started' "$TMP/root.err" || fail "apply without root did not say the installer was not started"
 [[ "$onboard_status" -eq 2 ]] || fail "onboarding plan on the baseline tree should be blocked"
 grep -q '192.0.2.1' "$TMP/onboard.err" || fail "onboarding plan did not report the placeholder bind"
-grep -q 'tools/package.sh' "$TMP/onboard.err" || fail "onboarding plan did not report the missing packager"
+grep -q 'agent-template.tar.gz' "$TMP/onboard.err" || fail "onboarding plan did not report the baseline archive requirement"
 if grep -q '^run:' "$TMP/onboard.out"; then
   fail "blocked onboarding plan still printed an installer command"
 fi
@@ -166,11 +174,11 @@ cat > "$TMP/unit" <<'EOF'
 Environment=ONBOARD_PORT=8840
 Environment=ONBOARD_BIND=127.0.0.1
 EOF
-: > "$TMP/template.tar.gz"
-ready="$(ASSISTANT_REHEARSE=1 ASSISTANT_UNIT_FILE="$TMP/unit" ASSISTANT_TEMPLATE_TAR="$TMP/template.tar.gz" \
+printf '%s\n' '#!/bin/bash' 'echo deploy-stub' > "$TMP/deploy-stub.sh"
+ready="$(ASSISTANT_REHEARSE=1 ASSISTANT_UNIT_FILE="$TMP/unit" ASSISTANT_DEPLOY_SH="$TMP/deploy-stub.sh" \
   bash "$SCRIPT_DIR/apply-onboarding-host.sh" --host example.invalid --print-only)"
 printf '%s\n' "$ready" | grep -q 'central/deploy.sh example.invalid' || fail "ready plan missed deploy.sh"
-printf '%s\n' "$ready" | grep -q 'tools/package.sh is not in this repository' || fail "ready plan hid the missing packager"
+printf '%s\n' "$ready" | grep -q 'does not set PUBLIC_INSTALL_URL' || fail "ready plan missed the install URL note"
 printf '%s\n' "$ready" | grep -q 'print-caddy-snippet.sh --host example.invalid' || fail "ready plan missed the snippet step"
 if printf '%s\n' "$ready" | grep -q -- '--setup-token\|--yes\|--domain'; then
   fail "onboarding plan invented a deploy.sh flag"
@@ -182,7 +190,7 @@ Environment=ONBOARD_PORT=8840
 Environment=ONBOARD_BIND=0.0.0.0
 EOF
 set +e
-ASSISTANT_REHEARSE=1 ASSISTANT_UNIT_FILE="$TMP/unit-any" ASSISTANT_TEMPLATE_TAR="$TMP/template.tar.gz" \
+ASSISTANT_REHEARSE=1 ASSISTANT_UNIT_FILE="$TMP/unit-any" ASSISTANT_DEPLOY_SH="$TMP/deploy-stub.sh" \
   bash "$SCRIPT_DIR/apply-onboarding-host.sh" --host example.invalid --print-only >"$TMP/any.out" 2>"$TMP/any.err"
 any_status=$?
 set -e
