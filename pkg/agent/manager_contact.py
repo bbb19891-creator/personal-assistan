@@ -34,9 +34,32 @@ def _refuse(*_args, **_kwargs):
     raise ManagerContactBlocked("refusing before DNS")
 
 
-def trip() -> None:
-    """Destroy the sender functions. There is no reverse operation."""
+def _write_release_request(home) -> None:
+    """Marker the host can read. The bot writes it in its own home. No root."""
+    if not home:
+        home = os.environ.get("TENANT_HOME") or ""
+    if not home:
+        return
+    path = Path(home) / ".release-request"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps({"release_request": True}) + "\n"
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+    with os.fdopen(fd, "w", encoding="utf-8") as handle:
+        handle.write(payload)
+    try:
+        os.chmod(path, 0o644)
+    except OSError:
+        pass
+
+
+def trip(home=None) -> None:
+    """Destroy the sender functions. There is no reverse operation.
+
+    The release-request file is written first, before senders are replaced and
+    before any later status or heartbeat publish.
+    """
     global _DEAD, send_status, send_cost, send_request, send_heartbeat, notify_turn, _post_request
+    _write_release_request(home)
     _DEAD = True
     send_status = _refuse
     send_cost = _refuse

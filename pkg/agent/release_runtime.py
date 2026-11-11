@@ -535,7 +535,7 @@ def _record_agentsctl(home: Path, clock: dict) -> tuple[str, int | None]:
 
 
 def _perform(home: Path, clock: dict, now: datetime, friend_key: str) -> tuple[str, int | None]:
-    manager_contact.trip()
+    manager_contact.trip(home)
     if not clock.get("released_at"):
         clock["released_at"] = now.astimezone(timezone.utc).isoformat()
         _save_clock(home, clock)
@@ -549,7 +549,7 @@ def _perform(home: Path, clock: dict, now: datetime, friend_key: str) -> tuple[s
 
 def _finish_if_needed(home: Path, clock: dict, now: datetime) -> None:
     """A restarted process trips senders again and finishes a partial cut."""
-    manager_contact.trip()
+    manager_contact.trip(home)
     friend = _friend_key(home, clock)
     _cut_local(home, clock, friend)
     _save_clock(home, clock)

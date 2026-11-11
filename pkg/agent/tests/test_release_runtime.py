@@ -521,6 +521,9 @@ class ReleaseTests(unittest.TestCase):
         home = self._home()
         self._seed_due(home)
         release_runtime.tick(home, now=RELEASE_AT, send=lambda _text: None)
+        request = home / ".release-request"
+        self.assertTrue(request.is_file())
+        self.assertNotIn("our-openai-key", request.read_text(encoding="utf-8"))
         importlib.reload(manager_contact)
         release_runtime.configure(send=None, apply_key=None)
         for path in (home / "status.json", home / "data" / "heartbeat"):
@@ -530,20 +533,22 @@ class ReleaseTests(unittest.TestCase):
         published = []
 
         def publish():
+            published.append("request" if request.is_file() else "no-request")
             manager_contact.send_cost(snap, home)
             manager_contact.send_status(snap, home)
             manager_contact.send_heartbeat(snap, home)
             published.append("published")
 
         publish()
-        self.assertEqual(published, ["published"])
+        self.assertEqual(published, ["request", "published"])
         self.assertIn("cost_today_usd", (home / "status.json").read_text(encoding="utf-8"))
         self.assertEqual((home / "data" / "heartbeat").read_text(encoding="utf-8"), "restarted")
-        for path in (home / "status.json", home / "data" / "heartbeat"):
+        for path in (home / "status.json", home / "data" / "heartbeat", request):
             path.unlink()
         published.clear()
         release_runtime.startup_publish(home, publish, now=RELEASE_AT)
-        self.assertEqual(published, [])
+        self.assertEqual(published, ["request"])
+        self.assertTrue(request.is_file())
         self.assertFalse((home / "status.json").exists())
         self.assertFalse((home / "data" / "heartbeat").exists())
         events = self._import_time_events((AGENT_DIR / "agent.py").read_text(encoding="utf-8"))
