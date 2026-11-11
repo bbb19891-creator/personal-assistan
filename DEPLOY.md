@@ -208,7 +208,17 @@ There is no new installer and no new flag. `pkg/host/install-host.sh` copies `pk
 
 `platform/assistant_manager.py` accepts only `serve`, `provision`, `tick`, and `render`. `AM_DATA` is required. A path whose second component is `root` is rejected. A row that is due is deleted by the same `delete_client` path as an explicit delete. That includes the row, status history, costs, requests, and invite codes.
 
-The live unit is `assistant-manager`. It stays on `127.0.0.1:8850`. The admin page stays at `/manage/` behind the Caddy basic auth that already proxies that path. This runbook does not edit Caddy and does not claim a reload.
+The live unit is `assistant-manager`. Intake and health stay on `127.0.0.1:8850`. The admin page stays at `/manage/` behind the Caddy basic auth that already proxies that path. This runbook does not edit Caddy and does not claim a reload.
+
+The unit file ships `AM_BIND_PROXY=127.0.0.1`. That placeholder is right when Caddy runs on the host and can open loopback. When Caddy runs in Docker or Podman, `127.0.0.1` inside the container is not the host, and `/manage/` breaks. Set the docker bridge address in a drop-in. The documentation example is `172.17.0.1`. Do not commit a different address from the live machine. Leave the unit file at `127.0.0.1` so a non-container Caddy still matches the file in git.
+
+```ini
+# /etc/systemd/system/assistant-manager.service.d/20-proxy-bind.conf
+[Service]
+Environment=AM_BIND_PROXY=172.17.0.1
+```
+
+`AM_BIND_LOCAL` stays `127.0.0.1`. With a different proxy bind, `/manage/` is served on the bridge address and intake stays on loopback. `docs/deploy/migrate-manager.sh` refuses to apply when it sees a running Caddy container, or `AM_CADDY_CONTAINER=1`, and the proxy bind is still loopback. It prints that the operator must set the bridge address and does not copy files.
 
 Use `/var/lib/assistant-manager` unless you have another path outside `/root`. Back up before the first write:
 
@@ -248,7 +258,7 @@ The script also installs:
 - `/etc/systemd/system/assistant-manager.service`
 - `/etc/systemd/system/assistant-manager.service.d/10-isolation.conf`
 
-`10-isolation.conf` keeps the process off `/root`. One listener on `127.0.0.1:8850` serves `/manage/` when the proxy header matches `proxy_secret`, and serves intake on the same socket. Leave the existing Caddy basic auth in front of `/manage/`.
+`10-isolation.conf` keeps the process off `/root`. When the two binds match, one socket on `127.0.0.1:8850` serves `/manage/` (with the proxy header) and intake. When Caddy is containerized, the drop-in above moves only `AM_BIND_PROXY` to the bridge. Leave the existing Caddy basic auth in front of `/manage/`. This change was not applied on the live server.
 
 ```bash
 sudo bash docs/deploy/migrate-manager.sh

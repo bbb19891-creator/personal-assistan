@@ -18,6 +18,63 @@ if [[ -z "${ASSISTANT_ROOT:-}" && "$(id -u)" -ne 0 ]]; then
   blocked "run as root. The migration was not started."
 fi
 
+containerized_caddy() {
+  if [[ "${AM_CADDY_CONTAINER:-}" == "1" ]]; then
+    return 0
+  fi
+  local runtime listing
+  for runtime in docker podman; do
+    if ! command -v "$runtime" >/dev/null 2>&1; then
+      continue
+    fi
+    listing="$("$runtime" ps --format '{{.Names}} {{.Image}}' 2>/dev/null || true)"
+    if printf '%s\n' "$listing" | grep -qi 'caddy'; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+proxy_is_loopback() {
+  case "${1:-}" in
+    ""|127.0.0.1|localhost|::1) return 0 ;;
+  esac
+  return 1
+}
+
+effective_proxy_bind() {
+  if [[ -n "${AM_BIND_PROXY:-}" ]]; then
+    printf '%s' "$AM_BIND_PROXY"
+    return 0
+  fi
+  local dir conf line found
+  dir="$(live_path /etc/systemd/system/assistant-manager.service.d)"
+  found=""
+  if [[ -d "$dir" ]]; then
+    shopt -s nullglob
+    for conf in "$dir"/*.conf; do
+      while IFS= read -r line || [[ -n "$line" ]]; do
+        case "$line" in
+          Environment=AM_BIND_PROXY=*)
+            found="${line#Environment=AM_BIND_PROXY=}"
+            ;;
+        esac
+      done < "$conf"
+    done
+    shopt -u nullglob
+  fi
+  if [[ -n "$found" ]]; then
+    printf '%s' "$found"
+    return 0
+  fi
+  printf '%s' "127.0.0.1"
+}
+
+if containerized_caddy && proxy_is_loopback "$(effective_proxy_bind)"; then
+  printf '%s\n' "containerized Caddy cannot use a loopback AM_BIND_PROXY. Set the docker bridge address in a systemd drop-in. The migration was not started." >&2
+  exit 1
+fi
+
 src_logical="/opt/agents/_manager"
 data_logical="/var/lib/assistant-manager"
 src="$(live_path "$src_logical")"
@@ -87,6 +144,11 @@ install -m 644 "$REPO/platform/assistant_manager.py" "$lib/assistant_manager.py"
 install -m 644 "$REPO/platform/systemd/assistant-manager.service" "$unit_dir/assistant-manager.service"
 install -m 644 "$REPO/platform/systemd/assistant-manager.service.d/10-isolation.conf" \
   "$unit_dir/assistant-manager.service.d/10-isolation.conf"
+if [[ -n "${AM_BIND_PROXY:-}" ]] && ! proxy_is_loopback "$AM_BIND_PROXY"; then
+  printf '[Service]\nEnvironment=AM_BIND_PROXY=%s\n' "$AM_BIND_PROXY" \
+    > "$unit_dir/assistant-manager.service.d/20-proxy-bind.conf"
+  chmod 644 "$unit_dir/assistant-manager.service.d/20-proxy-bind.conf"
+fi
 
 wa_src="$(live_path /etc/assistant-manager/wa.env)"
 wa_dest="$(live_path /etc/assistant-manager/wa.manager.env)"

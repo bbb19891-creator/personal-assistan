@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import base64
+import subprocess
+import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -33,6 +35,23 @@ def _guarded_files() -> list[Path]:
         else:
             files.extend(path for path in item.rglob("*") if path.is_file())
     return files
+
+
+def test_only_the_docker_bridge_example_is_allowed(tmp_path: Path) -> None:
+    good = "172.17.0." + "1"
+    other = "172.17.0." + "2"
+    sample = tmp_path / "note.txt"
+    sample.write_text(good + "\n" + other + "\n", encoding="utf-8")
+    scan = subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "secret_scan.py"), str(tmp_path)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert scan.returncode == 1
+    hits = [line for line in scan.stdout.splitlines() if "category=server-ip" in line]
+    assert hits == ["note.txt:2 category=server-ip"]
 
 
 def test_secret_scan_job_is_strict() -> None:

@@ -267,6 +267,31 @@ if printf '%s\n' "$phone_out" | grep -q "$phone_jid"; then
   fail "migration printed a derived jid"
 fi
 
+caddy_root="$TMP/mgr-caddy"
+mkdir -p "$caddy_root/opt/agents/_manager"
+printf '{}\n' > "$caddy_root/opt/agents/_manager/state.json"
+set +e
+caddy_out="$(AM_CADDY_CONTAINER=1 ASSISTANT_ROOT="$caddy_root" ASSISTANT_BACKUP_DIR="$TMP/mgr-caddy-backups" \
+  bash "$SCRIPT_DIR/migrate-manager.sh" 2>"$TMP/mgr-caddy.err")"
+caddy_status=$?
+set -e
+[[ "$caddy_status" -ne 0 ]] || fail "containerized Caddy was left on loopback"
+grep -q 'docker bridge' "$TMP/mgr-caddy.err" || fail "loopback refusal did not name the bridge address"
+grep -q 'not started' "$TMP/mgr-caddy.err" || fail "loopback refusal did not say the migration was not started"
+[[ ! -e "$caddy_root/var/lib/assistant-manager" ]] || fail "refused migration still copied data"
+[[ ! -e "$caddy_root/etc/systemd/system/assistant-manager.service" ]] || fail "refused migration still installed the unit"
+if printf '%s\n' "$caddy_out" | grep -q '^archive: '; then
+  fail "refused migration printed an archive"
+fi
+
+bind_root="$TMP/mgr-bind"
+mkdir -p "$bind_root/opt/agents/_manager"
+printf '{}\n' > "$bind_root/opt/agents/_manager/state.json"
+AM_CADDY_CONTAINER=1 AM_BIND_PROXY=192.0.2.1 ASSISTANT_ROOT="$bind_root" \
+  ASSISTANT_BACKUP_DIR="$TMP/mgr-bind-backups" bash "$SCRIPT_DIR/migrate-manager.sh" >/dev/null
+grep -q 'AM_BIND_PROXY=127.0.0.1' "$bind_root/etc/systemd/system/assistant-manager.service" || fail "unit placeholder was changed"
+grep -q 'AM_BIND_PROXY=192.0.2.1' "$bind_root/etc/systemd/system/assistant-manager.service.d/20-proxy-bind.conf" || fail "drop-in missed the operator bind"
+
 if command -v shellcheck >/dev/null 2>&1; then
   shellcheck -x "$SCRIPT_DIR"/*.sh
 fi
