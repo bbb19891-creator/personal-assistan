@@ -1,0 +1,36 @@
+[Unit]
+Description=Assistant bot %i - brain
+After=network-online.target assistant-bridge@%i.service
+Wants=network-online.target
+
+[Service]
+User=agent-%i
+Group=agent-%i
+WorkingDirectory=/opt/agents/%i
+Environment=AGENT_HOME=/opt/agents/%i
+Environment=AGENT_TENANT=%i
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/agents/_shared/venv/bin/python /opt/agents/_shared/agent/run.py
+Restart=always
+RestartSec=15
+# exit code 3 = not configured yet (no OpenAI key / WhatsApp); the setup page restarts it later
+RestartPreventExitStatus=3
+MemoryMax=700M
+CPUQuota=80%
+TasksMax=200
+StandardOutput=append:/opt/agents/%i/logs/bot.log
+StandardError=append:/opt/agents/%i/logs/bot.log
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/agents/%i
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,1 @@
+{"name":"wa-bridge","version":"1.0.0","private":true,"type":"module","main":"bridge.mjs","dependencies":{"@whiskeysockets/baileys":"^7.0.0-rc14","link-preview-js":"^3.2.0","pino":"^10.4.0","qrcode":"^1.5.4"}}

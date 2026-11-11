@@ -1,0 +1,19 @@
+[Unit]
+Description=WhatsApp Web bridge (Baileys) for the assistant - localhost only
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/agent/wa-bridge
+EnvironmentFile=/opt/agent/wa-bridge/.env
+Environment=WA_BASE=/opt/agent/wa-bridge
+ExecStart=/usr/bin/node /opt/agent/wa-bridge/bridge.mjs
+Restart=always
+RestartSec=5
+StandardOutput=append:/opt/agent/logs/bridge.log
+StandardError=append:/opt/agent/logs/bridge.log
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

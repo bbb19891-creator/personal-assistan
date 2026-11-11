@@ -1,0 +1,288 @@
+#!/usr/bin/env python3
+"""agentsctl - manage many isolated assistant bots on one host (run as root).
+Layout: /opt/agents/_shared (code, venv, node_modules)  /opt/agents/<slug> (one bot: .env 600, data/, logs/, wa-bridge/auth)
+Each bot runs as its own Linux user agent-<slug> with systemd template units and memory/CPU limits.
+Never touches anything outside /opt/agents, /var/lib/assistant-onboarding and its own assistant-* units."""
+import os, re, sys, json, time, shutil, secrets, subprocess, argparse, tarfile, pwd
+
+for _l in (open("/opt/agents/_shared/host.env").read().splitlines() if os.path.exists("/opt/agents/_shared/host.env") else []):
+    if "=" in _l and not _l.lstrip().startswith("#"):
+        _k, _v = _l.split("=", 1); os.environ.setdefault(_k.strip(), _v.strip())
+ROOT = os.environ.get("AGENTS_ROOT", "/opt/agents")
+SHARED = os.path.join(ROOT, "_shared")
+REG = os.path.join(ROOT, "registry.json")
+STATUS_DIR = os.path.join(ROOT, "_status")
+ARCHIVE = os.path.join(ROOT, "_archive")
+SPOOL = "/var/lib/assistant-onboarding"
+INVITES = os.path.join(SHARED, "invites.txt")
+PORT_BASE = int(os.environ.get("AGENTS_PORT_BASE", "21000"))
+ONBOARD_HOST = os.environ.get("ONBOARD_HOST", "")   # e.g. setup.example.com (setup pages: https://HOST/t/<slug>/)
+# measured on the reference host: bot ~175 MB RSS, bridge ~100-160 MB, setup page ~36 MB
+EST_MB = {"bot": 180, "bridge": 160, "setup": 40}
+PER_BOT_MB = sum(EST_MB.values())
+RESERVE_MB = int(os.environ.get("AGENTS_RESERVE_MB", "700"))   # keep free for the host's existing services
+PER_BOT_DISK_MB = 300
+UNITS = ("assistant-bridge@{s}", "assistant-setup@{s}", "assistant-restart@{s}.path", "assistant-bot@{s}")
+SLUG_RE = re.compile(r"^[a-z][a-z0-9-]{2,20}$")
+
+def sh(*a, check=True): return subprocess.run(a, capture_output=True, text=True, check=check)
+def need_root():
+    if os.geteuid() != 0: sys.exit("run as root")
+def load_reg():
+    try: return json.load(open(REG))
+    except Exception: return {}
+def save_reg(r):
+    tmp = REG + ".tmp"; fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f: json.dump(r, f, indent=1)
+    os.replace(tmp, REG); publish_routes(r)
+def publish_routes(r):
+    """slug -> setup port only (no secrets), read by the central onboarding proxy."""
+    os.makedirs(STATUS_DIR, exist_ok=True); os.chmod(STATUS_DIR, 0o755)
+    p = os.path.join(STATUS_DIR, "routes.json")
+    with open(p + ".tmp", "w") as f: json.dump({s: v["ports"]["setup"] for s, v in r.items()}, f)
+    os.chmod(p + ".tmp", 0o644); os.replace(p + ".tmp", p)
+def rnd(n=32): return secrets.token_urlsafe(n)[:n].replace("-", "x").replace("_", "y")
+def active(unit):
+    return sh("systemctl", "is-active", unit, check=False).stdout.strip()
+
+def meminfo():
+    d = {}
+    for line in open("/proc/meminfo"):
+        k, v = line.split(":"); d[k] = int(v.split()[0]) // 1024
+    return d
+
+def capacity(as_json=False, quiet=False):
+    m = meminfo(); du = shutil.disk_usage(ROOT if os.path.exists(ROOT) else "/")
+    n = len(load_reg())
+    avail = m.get("MemAvailable", 0)
+    fit_now = max(0, (avail - RESERVE_MB) // PER_BOT_MB)
+    fit_disk = max(0, (du.free // 2**20 - 2048) // PER_BOT_DISK_MB)
+    out = {"mem_total_mb": m.get("MemTotal"), "mem_available_mb": avail, "swap_total_mb": m.get("SwapTotal"),
+           "disk_free_gb": round(du.free / 2**30, 1), "bots_now": n, "est_mb_per_bot": PER_BOT_MB,
+           "reserve_mb": RESERVE_MB, "more_bots_fit_ram": int(fit_now), "more_bots_fit_disk": int(fit_disk),
+           "more_bots_fit": int(min(fit_now, fit_disk))}
+    if not quiet:
+        if as_json: print(json.dumps(out, indent=1))
+        else:
+            print(f"RAM: {avail} MB available of {m.get('MemTotal')} MB (swap {m.get('SwapTotal')} MB) | disk free {out['disk_free_gb']} GB")
+            print(f"bots now: {n} | estimate per bot: ~{PER_BOT_MB} MB RAM (bot {EST_MB['bot']} + WhatsApp {EST_MB['bridge']} + setup page {EST_MB['setup']}), ~{PER_BOT_DISK_MB} MB disk")
+            print(f"room for about {out['more_bots_fit']} more bot(s) (keeping {RESERVE_MB} MB free for existing services)")
+    return out
+
+def alloc_ports(reg):
+    used = {p for v in reg.values() for p in v["ports"].values()}
+    i = 0
+    while True:
+        b = PORT_BASE + 10 * i
+        cand = {"bridge": b, "inbound": b + 1, "setup": b + 2}
+        if not (set(cand.values()) & used) and not any(f":{p} " in sh("ss", "-ltn", check=False).stdout for p in cand.values()):
+            return cand
+        i += 1
+
+def write_file(path, text, mode=0o600, owner=None):
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+    with os.fdopen(fd, "w", encoding="utf-8") as f: f.write(text)
+    os.chmod(path, mode)
+    if owner: shutil.chown(path, owner, owner)
+
+def create(slug, bot_name="", owner_name="", owner_phone="", start=True, force=False):
+    need_root()
+    if not SLUG_RE.match(slug or ""): sys.exit("slug: 3-21 chars, a-z 0-9 -, starts with a letter")
+    reg = load_reg()
+    if slug in reg or os.path.exists(os.path.join(ROOT, slug)): sys.exit(f"bot '{slug}' already exists")
+    if not os.path.exists(os.path.join(SHARED, "agent", "run.py")): sys.exit("shared code missing: run install-host.sh first")
+    cap = capacity(quiet=True)
+    if cap["more_bots_fit"] < 1 and not force:
+        sys.exit(f"not enough capacity (RAM available {cap['mem_available_mb']} MB, disk {cap['disk_free_gb']} GB). Use --force to override.")
+    user = f"agent-{slug}"; home = os.path.join(ROOT, slug)
+    ports = alloc_ports(reg)
+    try: pwd.getpwnam(user)
+    except KeyError: sh("useradd", "--system", "--home-dir", home, "--no-create-home", "--shell", "/usr/sbin/nologin", user)
+    for d in ("", "data", "data/docs", "logs", "wa-bridge", ".run"):
+        os.makedirs(os.path.join(home, d), exist_ok=True)
+    env = open(os.path.join(SHARED, ".env.example"), encoding="utf-8").read()
+    bt = rnd(40)
+    sets = {"WA_BRIDGE_URL": f"http://127.0.0.1:{ports['bridge']}", "WA_BRIDGE_TOKEN": bt, "WA_INBOUND_PORT": str(ports["inbound"]),
+            "PUBLIC_BASE_URL": f"https://{ONBOARD_HOST}/t/{slug}" if ONBOARD_HOST else "",
+            "BOT_NAME": re.sub(r"[\r\n=]", "", bot_name)[:30], "WA_BOT_NAMES": re.sub(r"[\r\n=]", "", bot_name)[:30],
+            "OWNER_NAME": re.sub(r"[\r\n=]", "", owner_name)[:30], "OWNER_PHONE": re.sub(r"\D", "", owner_phone)[:15]}
+    for k, v in sets.items():
+        env = re.sub(rf"^{k}=.*$", f"{k}={v}", env, flags=re.M) if re.search(rf"^{k}=", env, re.M) else env + f"\n{k}={v}\n"
+    write_file(os.path.join(home, ".env"), env)
+    write_file(os.path.join(home, "wa-bridge", ".env"),
+               f"WA_BRIDGE_TOKEN={bt}\nWA_BRIDGE_PORT={ports['bridge']}\nWA_INBOUND_URL=http://127.0.0.1:{ports['inbound']}/wa/inbound\n")
+    write_file(os.path.join(home, "setup.env"), f"SETUP_PORT={ports['setup']}\nSETUP_BASE_PATH=/t/{slug}\nAGENT_TENANT={slug}\n", 0o644)
+    token = rnd(32)
+    write_file(os.path.join(home, ".setup_token"), token)
+    write_file(os.path.join(home, ".restart"), "", 0o600)
+    sh("chown", "-R", f"{user}:{user}", home)
+    os.chmod(home, 0o700)
+    os.chown(os.path.join(home, "setup.env"), 0, 0)   # root-owned: the bot cannot change its own port/prefix
+    reg[slug] = {"user": user, "ports": ports, "created": time.strftime("%Y-%m-%d %H:%M:%S")}
+    save_reg(reg)
+    if start:
+        for u in UNITS[:3]: sh("systemctl", "enable", "--now", u.format(s=slug), check=False)
+    link = f"https://{ONBOARD_HOST}/t/{slug}/?t={token}" if ONBOARD_HOST else f"(setup page on 127.0.0.1:{ports['setup']}, token in {home}/.setup_token)"
+    print(json.dumps({"ok": True, "slug": slug, "ports": ports, "started": start, "link": link}))
+    return slug, token
+
+def cmd_list():
+    reg = load_reg()
+    if not reg: print("no bots"); return
+    for s, v in sorted(reg.items()):
+        st = " ".join(f"{u.split('@')[0].replace('assistant-', '')}={active(u.format(s=s))}" for u in UNITS)
+        print(f"{s:<22} ports {v['ports']['bridge']}-{v['ports']['setup']}  {st}  created {v['created']}")
+
+def units(slug, action):
+    need_root()
+    if slug not in load_reg(): sys.exit("unknown bot")
+    order = UNITS if action != "stop" else tuple(reversed(UNITS))
+    for u in order:
+        u = u.format(s=slug)
+        if action == "start" and u.startswith("assistant-bot@"): sh("systemctl", "start", u, check=False); continue
+        sh("systemctl", {"start": "enable", "stop": "disable", "restart": "restart"}[action], *(["--now"] if action != "restart" else []), u, check=False)
+    print(f"{action}: {slug}")
+
+def delete(slug, purge=False):
+    need_root()
+    reg = load_reg()
+    if slug not in reg: sys.exit("unknown bot")
+    units(slug, "stop")
+    home = os.path.join(ROOT, slug)
+    if not purge and os.path.exists(home):
+        os.makedirs(ARCHIVE, mode=0o700, exist_ok=True)
+        dst = os.path.join(ARCHIVE, f"{slug}-{time.strftime('%Y%m%d-%H%M%S')}.tar.gz")
+        with tarfile.open(dst, "w:gz") as t: t.add(home, arcname=slug)
+        os.chmod(dst, 0o600); print(f"archived to {dst}")
+    shutil.rmtree(home, ignore_errors=True)
+    sh("userdel", reg[slug]["user"], check=False)
+    for f in (os.path.join(STATUS_DIR, f"{slug}.json"),):
+        try: os.remove(f)
+        except FileNotFoundError: pass
+    reg.pop(slug); save_reg(reg); print(f"deleted {slug}")
+
+def link(slug, new=False):
+    need_root()
+    home = os.path.join(ROOT, slug)
+    if slug not in load_reg(): sys.exit("unknown bot")
+    p = os.path.join(home, ".setup_token")
+    if new:
+        write_file(p, rnd(32), owner=load_reg()[slug]["user"]); sh("systemctl", "restart", f"assistant-setup@{slug}", check=False)
+    tok = open(p).read().strip()
+    print(f"https://{ONBOARD_HOST}/t/{slug}/?t={tok}" if ONBOARD_HOST else tok)
+
+HEALTH_KEYS = ("updated_at", "whatsapp_connected", "google_connected", "openai_key_set", "cost_today_usd", "cost_month_usd", "cost_ceiling_usd")
+def status(write=False, as_json=False):
+    """Health only: unit states + whitelisted keys from each bot's status.json. Never reads messages, mail, memories or keys."""
+    out = {}
+    for s in sorted(load_reg()):
+        h = {}
+        try:
+            raw = json.load(open(os.path.join(ROOT, s, "status.json")))
+            h = {k: raw.get(k) for k in HEALTH_KEYS}
+        except Exception: pass
+        try: age = int(time.time() - os.path.getmtime(os.path.join(ROOT, s, "data", "heartbeat")))
+        except Exception: age = None
+        bot = active(f"assistant-bot@{s}")
+        out[s] = {"bot_unit": bot, "bridge_unit": active(f"assistant-bridge@{s}"), "setup_unit": active(f"assistant-setup@{s}"),
+                  "heartbeat_age_s": age, "up": bot == "active" and age is not None and age < 300, **h,
+                  "checked_at": time.strftime("%Y-%m-%dT%H:%M:%S")}
+    if write:
+        rs = os.path.join(SPOOL, "results")   # handoff results carry a setup link: keep them 30 minutes at most
+        for fn in (os.listdir(rs) if os.path.isdir(rs) else []):
+            try:
+                if time.time() - os.path.getmtime(os.path.join(rs, fn)) > 1800: os.remove(os.path.join(rs, fn))
+            except Exception: pass
+        os.makedirs(STATUS_DIR, exist_ok=True); os.chmod(STATUS_DIR, 0o755)
+        for s, d in out.items():
+            p = os.path.join(STATUS_DIR, f"{s}.json")
+            with open(p + ".tmp", "w") as f: json.dump(d, f)
+            os.chmod(p + ".tmp", 0o644); os.replace(p + ".tmp", p)
+        p = os.path.join(STATUS_DIR, "index.json")
+        with open(p + ".tmp", "w") as f: json.dump({"checked_at": time.strftime("%Y-%m-%dT%H:%M:%S"), "bots": out, "capacity": capacity(quiet=True)}, f)
+        os.chmod(p + ".tmp", 0o644); os.replace(p + ".tmp", p)
+    if as_json or not write: print(json.dumps(out, indent=1, ensure_ascii=False))
+
+def export(slug, dst):
+    """Everything needed to move a bot to its own server (install.sh --restore FILE)."""
+    need_root()
+    home = os.path.join(ROOT, slug)
+    if slug not in load_reg(): sys.exit("unknown bot")
+    fd = os.open(dst, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600); os.close(fd)
+    with tarfile.open(dst, "w:gz") as t:
+        for rel in (".env", "persona.txt", "data", "wa-bridge/auth"):
+            p = os.path.join(home, rel)
+            if os.path.exists(p): t.add(p, arcname=rel)
+    print(f"exported {slug} -> {dst} (contains secrets, keep private). Stop the bot here before starting it on the new server.")
+
+def consume_invite(code):
+    code = (code or "").strip()
+    if not code or not os.path.exists(INVITES): return False
+    lines = [l.strip() for l in open(INVITES) if l.strip()]
+    if code not in lines: return False
+    lines.remove(code); write_file(INVITES, "\n".join(lines) + ("\n" if lines else ""))
+    return True
+
+def process_requests():
+    """Requests written by the onboarding site -> new bots. Results readable only by the onboarding user."""
+    need_root()
+    rq, rs = os.path.join(SPOOL, "requests"), os.path.join(SPOOL, "results")
+    os.makedirs(rs, exist_ok=True)
+    for fn in sorted(os.listdir(rq)) if os.path.isdir(rq) else []:
+        p = os.path.join(rq, fn)
+        try: r = json.load(open(p))
+        except Exception: r = {}
+        os.remove(p)
+        rid = re.sub(r"[^\w-]", "", str(r.get("id", "")))[:40]
+        if not rid: continue
+        res = {"ok": False}
+        try:
+            if not consume_invite(r.get("invite")): res["error"] = "קוד ההזמנה לא תקין או שכבר נוצל."
+            elif capacity(quiet=True)["more_bots_fit"] < 1: res["error"] = "השרת מלא כרגע. נסה שוב מאוחר יותר."
+            else:
+                base = re.sub(r"[^a-z0-9-]", "", str(r.get("slug") or "").lower())[:14].strip("-") or "bot"
+                if not base[0].isalpha(): base = "b" + base
+                slug = base; i = 2
+                while slug in load_reg() or os.path.exists(os.path.join(ROOT, slug)): slug = f"{base}-{i}"; i += 1
+                slug, token = create(slug, bot_name=str(r.get("bot_name") or ""), start=True)
+                res = {"ok": True, "slug": slug, "path": f"/t/{slug}/?t={token}"}
+        except SystemExit as e: res["error"] = str(e)
+        except Exception as e: res["error"] = f"{type(e).__name__}"
+        out = os.path.join(rs, rid + ".json")
+        write_file(out, json.dumps(res, ensure_ascii=False), 0o640)
+        try: shutil.chown(out, "root", "assistant-onboard")
+        except Exception: pass
+
+def main():
+    ap = argparse.ArgumentParser(prog="agentsctl")
+    sp = ap.add_subparsers(dest="cmd", required=True)
+    c = sp.add_parser("create"); c.add_argument("slug"); c.add_argument("--bot-name", default=""); c.add_argument("--owner-name", default="")
+    c.add_argument("--owner-phone", default=""); c.add_argument("--no-start", action="store_true"); c.add_argument("--force", action="store_true")
+    sp.add_parser("list")
+    for a in ("start", "stop", "restart"): sp.add_parser(a).add_argument("slug")
+    d = sp.add_parser("delete"); d.add_argument("slug"); d.add_argument("--purge", action="store_true"); d.add_argument("--yes", action="store_true")
+    l = sp.add_parser("link"); l.add_argument("slug"); l.add_argument("--new", action="store_true")
+    s = sp.add_parser("status"); s.add_argument("--write", action="store_true"); s.add_argument("--json", action="store_true")
+    k = sp.add_parser("capacity"); k.add_argument("--json", action="store_true")
+    e = sp.add_parser("export"); e.add_argument("slug"); e.add_argument("dst")
+    i = sp.add_parser("invite"); i.add_argument("--count", type=int, default=1)
+    sp.add_parser("process-requests")
+    a = ap.parse_args()
+    if a.cmd == "create": create(a.slug, a.bot_name, a.owner_name, a.owner_phone, start=not a.no_start, force=a.force)
+    elif a.cmd == "list": cmd_list()
+    elif a.cmd in ("start", "stop", "restart"): units(a.slug, a.cmd)
+    elif a.cmd == "delete":
+        if not a.yes: sys.exit("add --yes to confirm (without --purge the bot is archived first)")
+        delete(a.slug, a.purge)
+    elif a.cmd == "link": link(a.slug, a.new)
+    elif a.cmd == "status": status(a.write, a.json)
+    elif a.cmd == "capacity": capacity(a.json)
+    elif a.cmd == "export": export(a.slug, a.dst)
+    elif a.cmd == "invite":
+        need_root(); codes = [rnd(10) for _ in range(a.count)]
+        old = open(INVITES).read() if os.path.exists(INVITES) else ""
+        write_file(INVITES, old + "".join(c + "\n" for c in codes)); print("\n".join(codes))
+    elif a.cmd == "process-requests": process_requests()
+
+if __name__ == "__main__":
+    main()

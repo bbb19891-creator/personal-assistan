@@ -1,0 +1,6 @@
+# Add to /etc/caddy/Caddyfile (after creating a DNS A record for the host -> this server's IP), then (Caddy runs in Docker here): docker exec n8n-setup-caddy-1 caddy validate --config /etc/caddy/Caddyfile && docker exec n8n-setup-caddy-1 caddy reload --config /etc/caddy/Caddyfile
+__ONBOARD_HOST__ {
+	encode gzip
+	# 192.0.2.1 is a documentation placeholder. Use the docker bridge address.
+	reverse_proxy 192.0.2.1:8840
+}

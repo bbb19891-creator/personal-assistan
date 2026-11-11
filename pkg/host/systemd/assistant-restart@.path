@@ -1,0 +1,9 @@
+[Unit]
+Description=Assistant bot %i - restart request from its setup page
+
+[Path]
+PathChanged=/opt/agents/%i/.restart
+Unit=assistant-restart@%i.service
+
+[Install]
+WantedBy=multi-user.target

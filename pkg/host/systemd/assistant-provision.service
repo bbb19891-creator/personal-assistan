@@ -1,0 +1,7 @@
+[Unit]
+Description=Assistant bots - create bots requested by the onboarding site
+
+[Service]
+Type=oneshot
+EnvironmentFile=-/opt/agents/_shared/host.env
+ExecStart=/usr/local/sbin/agentsctl process-requests
