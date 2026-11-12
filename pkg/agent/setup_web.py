@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Setup & connections page for the assistant (runs on the owner's own server, behind Caddy HTTPS).
 One step per page: 1) identity 2) WhatsApp 3) OpenAI 4) Google 5) done. Afterwards it is the status / reconnect page.
-Access: one-time setup link (?t=<token>) -> HttpOnly cookie. Secrets are written to AGENT_HOME/.env (600) and never shown back."""
-import os, re, sys, json, hmac, html, time, hashlib, secrets, subprocess, urllib.parse, urllib.request
+The status page opens support access, shows who can enter the server, and sends a team request only after an explicit consent checkbox.
+Self-host mode has no team-request hook. Access: one-time setup link (?t=<token>) -> HttpOnly cookie.
+Secrets are written to AGENT_HOME/.env (600) and never shown back."""
+import os, re, sys, json, hmac, html, time, hashlib, secrets, subprocess, threading, urllib.parse, urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 CODE = os.path.dirname(os.path.abspath(__file__))
@@ -126,6 +128,7 @@ CSS = """*{box-sizing:border-box}body{margin:0;font-family:system-ui,-apple-syst
 h1{font-size:1.35rem;margin:.4em 0 .2em}p{margin:.5em 0}.muted{color:#5B6275;font-size:.95rem}.steps{display:flex;gap:6px;justify-content:center;margin:4px 0 14px}
 .dot{width:30px;height:6px;border-radius:4px;background:#D9DCE6}.dot.on{background:#6C5CE7}.dot.ok{background:#22C55E}
 label{display:block;font-weight:600;margin:14px 0 4px}input,textarea,select{width:100%;font-size:16px;padding:12px;border:1px solid #CFD3DE;border-radius:12px;background:#fff}
+input[type=checkbox]{width:auto;padding:0;margin-inline-end:8px}
 textarea{min-height:90px}input[dir=ltr]{text-align:left}.btn{display:block;width:100%;text-align:center;font-size:1.05rem;font-weight:700;padding:14px;border-radius:14px;border:0;margin-top:16px;cursor:pointer;text-decoration:none}
 .pri{background:#6C5CE7;color:#fff}.sec{background:#EEF0F7;color:#1F2330}.ok{color:#15803D;font-weight:700}.bad{color:#B91C1C;font-weight:700}
 .status{display:inline-block;padding:4px 10px;border-radius:999px;font-size:.9rem;font-weight:700}.s-ok{background:#DCFCE7;color:#15803D}.s-wait{background:#FEF3C7;color:#92400E}
@@ -322,7 +325,8 @@ def view_done(st):
     run = '<p class="ok">✅ הבוט פועל</p>' if st["bot_running"] else '<p class="bad">הבוט עוד לא פועל — חסר חיבור (וואטסאפ / OpenAI / פרטים)</p>'
     return page("החיבורים שלי", f"""{LOGO['done']}<h1>{html.escape(st.get('bot_name') or 'הבוט')} — החיבורים</h1>{run}{lst}
 <div class="note"><b>איך מתחילים?</b><ol class="small"><li>שמור את המספר של העוזר{f' <bdi dir="ltr"><b>+{html.escape(me)}</b></bdi>' if me else ''} באנשי הקשר שלך.</li><li>מהוואטסאפ הפרטי שלך שלח לו הודעה, למשל: "היי, מה אתה יודע לעשות?"</li><li>רוצה אותו בקבוצה? מוסיפים אותו כמו כל איש קשר.</li></ol></div>
-<p class="muted small">שמור את הדף הזה במועדפים. דרכו מחברים מחדש כל דבר.</p>""", None, st)
+<p class="muted small">שמור את הדף הזה במועדפים. דרכו מחברים מחדש כל דבר.</p>
+{management_block()}""", None, st)
 
 GUIDE = """<h1>מדריך: מפתח חיבור ל-Google</h1>
 <div class="need"><b>נוח יותר ממחשב.</b>כל קישור נפתח בלשונית חדשה, ואחרי כל שלב חוזרים לכאן.</div>
@@ -344,6 +348,471 @@ GUIDE = """<h1>מדריך: מפתח חיבור ל-Google</h1>
 </ul></details>
 <p class="muted small">האפליקציה שייכת רק לך, והחיבור נשמר רק בשרת שלך. מסך "האפליקציה לא אומתה" צפוי, כי זו אפליקציה שיצרת בעצמך.</p>
 <a class="btn pri" href="/step/google">חזרה לחיבור ←</a>"""
+
+# ---------------- support access, server keys, team requests ----------------
+# Grants and the team-request hook live on the friend's server.
+# Host SSH should run `python3 setup_web.py support-login` when a support session starts,
+# and should allow that session only while support_is_open() is true.
+# Opening a grant stores local state only. It does not send anything out.
+# Self-host (SELF_HOST=1, ASSISTANT_MODE=self-host/own-server, or no manager token) has no team hook.
+
+_SUPPORT_LOCK = threading.Lock()
+_SSH_LOCK = threading.Lock()
+TEAM_SENDER = None
+ALLOWED_HOURS = (1, 4, 24, 72)
+_SLUG_RE = re.compile(r"^[a-z][a-z0-9-]{2,20}$")
+_SUMMARY_MAX = 300
+
+def agent_home():
+    return os.environ.get("AGENT_HOME") or HOME
+
+def _clock(now):
+    return time.time() if now is None else float(now)
+
+def _support_path(home):
+    return os.path.join(home, "support_access.json")
+
+def _empty_support():
+    return {"grant": None, "logins": []}
+
+def _load_support(home):
+    try:
+        with open(_support_path(home), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except Exception:
+        return _empty_support()
+    if not isinstance(data, dict):
+        return _empty_support()
+    grant = data.get("grant")
+    if grant is not None and not isinstance(grant, dict):
+        grant = None
+    logins = [x for x in (data.get("logins") or []) if isinstance(x, dict)]
+    return {"grant": grant, "logins": logins[-200:]}
+
+def _save_support(home, data):
+    os.makedirs(home, exist_ok=True)
+    path = _support_path(home)
+    tmp = path + ".tmp"
+    payload = {"grant": data.get("grant"), "logins": (data.get("logins") or [])[-200:]}
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, ensure_ascii=False)
+    os.chmod(tmp, 0o600)
+    os.replace(tmp, path)
+    os.chmod(path, 0o600)
+
+def _grant_open(data, now):
+    grant = data.get("grant")
+    if not isinstance(grant, dict) or grant.get("closed_at"):
+        return False
+    try:
+        return float(grant.get("expires_at") or 0) > float(now)
+    except (TypeError, ValueError):
+        return False
+
+def _expire_support(home, now):
+    data = _load_support(home)
+    grant = data.get("grant")
+    if isinstance(grant, dict) and not grant.get("closed_at"):
+        try:
+            exp = float(grant.get("expires_at") or 0)
+        except (TypeError, ValueError):
+            exp = 0
+        if exp <= now:
+            grant["closed_at"] = exp or now
+            grant["close_reason"] = "expired"
+            data["grant"] = grant
+            _save_support(home, data)
+    return data
+
+def _public_support(data, now):
+    grant = data.get("grant") if isinstance(data.get("grant"), dict) else None
+    active = None
+    if grant and _grant_open(data, now):
+        active = {
+            "id": grant.get("id") or "",
+            "hours": grant.get("hours"),
+            "opened_at": grant.get("opened_at"),
+            "expires_at": grant.get("expires_at"),
+        }
+    logins = []
+    for item in (data.get("logins") or [])[-30:]:
+        logins.append({
+            "at": item.get("at"),
+            "kind": "support",
+            "result": "ok" if item.get("result") == "ok" else "denied",
+            "grant_id": str(item.get("grant_id") or ""),
+        })
+    return {"open": active is not None, "grant": active, "grants": [active] if active else [], "logins": logins}
+
+def _parse_hours(value):
+    if isinstance(value, bool):
+        raise ValueError("hours")
+    if isinstance(value, int):
+        hours = value
+    else:
+        text = str(value or "").strip()
+        if not re.fullmatch(r"\d{1,2}", text):
+            raise ValueError("hours")
+        hours = int(text)
+    if hours not in ALLOWED_HOURS:
+        raise ValueError("hours")
+    return hours
+
+def support_view(home=None, now=None):
+    home = home or agent_home()
+    now = _clock(now)
+    with _SUPPORT_LOCK:
+        data = _expire_support(home, now)
+        return _public_support(data, now)
+
+def support_is_open(home=None, now=None):
+    return bool(support_view(home, now).get("open"))
+
+def open_support(hours, home=None, now=None):
+    home = home or agent_home()
+    now = _clock(now)
+    try:
+        hours = _parse_hours(hours)
+    except ValueError:
+        return {"ok": False, "error": "hours"}
+    with _SUPPORT_LOCK:
+        data = _expire_support(home, now)
+        if _grant_open(data, now):
+            return {"ok": False, "error": "already-open", "view": _public_support(data, now)}
+        data["grant"] = {
+            "id": secrets.token_hex(8),
+            "hours": hours,
+            "opened_at": now,
+            "expires_at": now + hours * 3600,
+            "closed_at": None,
+            "close_reason": "",
+        }
+        _save_support(home, data)
+        return {"ok": True, "view": _public_support(data, now)}
+
+def close_support(home=None, now=None):
+    home = home or agent_home()
+    now = _clock(now)
+    with _SUPPORT_LOCK:
+        data = _expire_support(home, now)
+        grant = data.get("grant")
+        if isinstance(grant, dict) and _grant_open(data, now):
+            grant["closed_at"] = now
+            grant["close_reason"] = "closed"
+            data["grant"] = grant
+            _save_support(home, data)
+        return {"ok": True, "view": _public_support(data, now)}
+
+def record_support_login(home=None, now=None):
+    """Append one support login: time, grant id, and result. Never chat content.
+
+    Integration point: the host calls this when a support SSH session starts.
+    """
+    home = home or agent_home()
+    now = _clock(now)
+    with _SUPPORT_LOCK:
+        data = _expire_support(home, now)
+        grant = data.get("grant") if isinstance(data.get("grant"), dict) else {}
+        entry = {
+            "at": now,
+            "kind": "support",
+            "result": "ok" if _grant_open(data, now) else "denied",
+            "grant_id": str(grant.get("id") or ""),
+        }
+        data["logins"] = (data.get("logins") or [])[-199:] + [entry]
+        _save_support(home, data)
+        return dict(entry)
+
+def resolve_keys_path():
+    return (os.environ.get("SSH_AUTHORIZED_KEYS") or "").strip() or os.path.expanduser("~/.ssh/authorized_keys")
+
+def _fingerprint(key_type, material):
+    return hashlib.sha256(f"{key_type} {material}".encode("utf-8")).hexdigest()
+
+_KEY_RE = re.compile(
+    r"(ssh-ed25519|ssh-rsa|ssh-dss|ecdsa-sha2-nistp256|ecdsa-sha2-nistp384|ecdsa-sha2-nistp521|"
+    r"sk-ssh-ed25519@openssh\.com|sk-ecdsa-sha2-nistp256@openssh\.com)\s+(\S+)(?:\s+(.*))?$"
+)
+
+def _parse_key_line(raw):
+    text = (raw or "").strip()
+    if not text or text.startswith("#"):
+        return None
+    match = _KEY_RE.search(text)
+    if not match:
+        return None
+    return match.group(1), match.group(2), (match.group(3) or "").strip()[:80]
+
+def list_ssh_keys(path=None):
+    path = path or resolve_keys_path()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except Exception:
+        return []
+    keys = []
+    for line in text.splitlines():
+        parsed = _parse_key_line(line)
+        if not parsed:
+            continue
+        key_type, material, comment = parsed
+        keys.append({
+            "fingerprint": _fingerprint(key_type, material),
+            "type": key_type,
+            "comment": comment,
+        })
+    return keys
+
+def delete_ssh_key(fingerprint, path=None):
+    path = path or resolve_keys_path()
+    if not re.fullmatch(r"[0-9a-f]{64}", str(fingerprint or "")):
+        return {"ok": False, "error": "bad-fingerprint"}
+    with _SSH_LOCK:
+        try:
+            with open(path, encoding="utf-8") as fh:
+                text = fh.read()
+        except FileNotFoundError:
+            return {"ok": False, "error": "missing"}
+        except Exception:
+            return {"ok": False, "error": "read"}
+        kept = []
+        removed = 0
+        for line in text.splitlines():
+            parsed = _parse_key_line(line)
+            if parsed and _fingerprint(parsed[0], parsed[1]) == fingerprint:
+                removed += 1
+                continue
+            kept.append(line)
+        if removed == 0:
+            return {"ok": False, "error": "not-found"}
+        body = ("\n".join(kept) + "\n") if kept else ""
+        tmp = path + ".tmp"
+        try:
+            mode = os.stat(path).st_mode & 0o777
+        except Exception:
+            mode = 0o600
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, mode)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        os.replace(tmp, path)
+        return {"ok": True, "removed": removed}
+
+def _self_host():
+    if (os.environ.get("SELF_HOST") or "").strip() == "1":
+        return True
+    mode = (os.environ.get("ASSISTANT_MODE") or "").strip().lower()
+    return mode in {"self-host", "selfhost", "own-server"}
+
+def _manager_pair():
+    if _self_host():
+        return "", ""
+    url = (os.environ.get("MANAGER_URL") or "").strip().rstrip("/")
+    tok = (os.environ.get("MANAGER_TOKEN") or "").strip()
+    token_file = os.path.join(agent_home(), ".manager_token")
+    if not tok and os.path.isfile(token_file):
+        try:
+            tok = open(token_file, encoding="utf-8").read().strip()
+        except Exception:
+            tok = ""
+    if tok and not url and os.path.isfile(token_file):
+        url = "http://127.0.0.1:8850"
+    if not url or not tok:
+        return "", ""
+    return url, tok
+
+def team_hook_available():
+    url, tok = _manager_pair()
+    return bool(url and tok)
+
+def clean_summary(text):
+    return " ".join(str(text or "").split())[:_SUMMARY_MAX].strip()
+
+def tenant_slug(home=None):
+    raw = (os.environ.get("AGENT_TENANT") or "").strip().lower()
+    if _SLUG_RE.fullmatch(raw):
+        return raw
+    base = os.path.basename(os.path.normpath(home or agent_home())).lower()
+    if _SLUG_RE.fullmatch(base):
+        return base
+    return ""
+
+def _consent_yes(consent):
+    return consent is True or str(consent or "").strip().lower() == "yes"
+
+def build_team_payload(summary, consent="yes", home=None):
+    """summary is the consented sentence. slug is the tenant id when it is a hosted slug.
+    Other form fields, chat text, and files are not copied. None if the hook is absent or consent is missing."""
+    if not team_hook_available() or not _consent_yes(consent):
+        return None
+    text = summary.get("summary") if isinstance(summary, dict) else summary
+    text = clean_summary(text)
+    if len(text) < 3:
+        return None
+    payload = {"summary": text}
+    slug = tenant_slug(home)
+    if slug:
+        payload["slug"] = slug
+    return payload
+
+def _default_team_sender(payload, opener=None):
+    url, tok = _manager_pair()
+    if not url or not tok:
+        raise RuntimeError("absent")
+    body_obj = {"summary": clean_summary((payload or {}).get("summary"))}
+    slug = (payload or {}).get("slug") if isinstance(payload, dict) else ""
+    if isinstance(slug, str) and _SLUG_RE.fullmatch(slug):
+        body_obj["slug"] = slug
+    data = json.dumps(body_obj, ensure_ascii=False).encode("utf-8")
+    req = urllib.request.Request(
+        url + "/intake",
+        data=data,
+        method="POST",
+        headers={"content-type": "application/json", "x-manager-token": tok},
+    )
+    open_fn = opener or urllib.request.urlopen
+    with open_fn(req, timeout=10) as resp:
+        raw = resp.read(2000)
+    try:
+        parsed = json.loads(raw or b"{}")
+    except Exception as exc:
+        raise RuntimeError("bad-response") from exc
+    if not isinstance(parsed, dict) or parsed.get("ok") is not True:
+        raise RuntimeError("not-ok")
+    return parsed
+
+def submit_team_request(summary, consent, sender=None, home=None):
+    if not team_hook_available():
+        return {"ok": False, "sent": False, "absent": True}
+    if not _consent_yes(consent):
+        return {"ok": False, "sent": False, "absent": False, "error": "לא נשלח. צריך לסמן הסכמה."}
+    payload = build_team_payload(summary, consent="yes", home=home)
+    if not payload:
+        return {"ok": False, "sent": False, "absent": False, "error": "לא נשלח. כתוב משפט אחד."}
+    send = sender if sender is not None else TEAM_SENDER
+    if send is None:
+        send = _default_team_sender
+    try:
+        send(payload)
+    except Exception:
+        return {"ok": False, "sent": False, "absent": False, "error": "לא נשלח. אפשר לנסות שוב."}
+    return {"ok": True, "sent": True, "absent": False}
+
+def _fmt_time(ts):
+    try:
+        return time.strftime("%Y-%m-%d %H:%M", time.localtime(float(ts)))
+    except Exception:
+        return ""
+
+def _login_html(logins):
+    if not logins:
+        return "<p class='muted'>אין כניסות.</p>"
+    rows = []
+    for item in reversed(list(logins)[-20:]):
+        label = "נכנסה תמיכה" if item.get("result") == "ok" else "ניסיון שנדחה"
+        when = html.escape(_fmt_time(item.get("at")))
+        rows.append(f"<li>{label} · <span dir='ltr'>{when}</span></li>")
+    return "<ul>" + "".join(rows) + "</ul>"
+
+def team_block(msg=""):
+    if not team_hook_available():
+        return ""
+    msg = str(msg or "")
+    note = f"<p class='ok'>{html.escape(msg)}</p>" if msg.startswith("נשלח") else ""
+    err = f"<div class='msg'>{html.escape(msg)}</div>" if msg and not msg.startswith("נשלח") else ""
+    return f"""<h2>בקשה לצוות</h2>
+<p class="why">כתוב משפט אחד. מה לשנות.</p>
+{note}{err}
+<form method="post" action="/team/request">
+<label>מה לשנות</label>
+<textarea name="summary" maxlength="300" required></textarea>
+<p><input type="checkbox" name="consent" value="yes"> אני מסכים. יישלח רק המשפט הזה. בלי שיחות.</p>
+<button class="btn pri">שלח לצוות</button>
+</form>"""
+
+def management_block():
+    try:
+        view = support_view()
+    except Exception:
+        view = {"open": False, "logins": []}
+    state = "<p class='ok'>הגישה פתוחה.</p>" if view.get("open") else "<p class='muted'>הגישה סגורה.</p>"
+    return f"""<h2>תמיכה</h2>
+{state}
+<a class="btn sec" href="/support">פתח גישה לתמיכה</a>
+<a class="btn sec" href="/who">מי יכול להיכנס לשרת שלי?</a>
+<h2>כניסות תמיכה</h2>
+{_login_html(view.get("logins") or [])}
+{team_block()}"""
+
+def view_support(home=None, now=None, error=""):
+    home = home or agent_home()
+    view = support_view(home, now)
+    err = f"<div class='msg'>{html.escape(error)}</div>" if error else ""
+    if view["open"]:
+        grant = view.get("grant") or {}
+        when = html.escape(_fmt_time(grant.get("expires_at")))
+        controls = f"""<p class="ok">הגישה פתוחה.</p>
+<p>נסגרת לבד ב-<span dir="ltr">{when}</span>.</p>
+<form method="post" action="/support/close"><button class="btn pri">סגור גישה</button></form>"""
+    else:
+        controls = """<p>הגישה סגורה. אנחנו לא נכנסים.</p>
+<p class="why">אם אתה רוצה עזרה, בחר כמה זמן. אחר כך זה נסגר לבד.</p>
+<form method="post" action="/support/open">
+<button class="btn pri" name="hours" value="1">שעה אחת</button>
+<button class="btn sec" name="hours" value="4">4 שעות</button>
+<button class="btn sec" name="hours" value="24">24 שעות</button>
+<button class="btn sec" name="hours" value="72">72 שעות</button>
+</form>"""
+    body = f"""{LOGO['bot']}<h1>פתח גישה לתמיכה</h1>
+{err}{controls}
+<h2>כניסות תמיכה</h2>
+{_login_html(view["logins"])}
+<a class="btn sec" href="/status">חזרה</a>"""
+    return page("פתח גישה לתמיכה", body)
+
+def view_who(home=None, now=None, keys_path=None, error=""):
+    home = home or agent_home()
+    view = support_view(home, now)
+    path = keys_path or resolve_keys_path()
+    keys = list_ssh_keys(path)
+    if keys:
+        rows = []
+        for key in keys:
+            name = html.escape(key["comment"] or "מפתח בלי שם")
+            fp = html.escape(key["fingerprint"])
+            rows.append(
+                '<div class="row"><div class="grow"><b>' + name + '</b><br><span class="small" dir="ltr">' + fp + '</span></div>'
+                '<form method="post" action="/who/delete"><input type="hidden" name="fingerprint" value="' + fp + '">'
+                '<button class="btn sec">מחק</button></form></div>'
+            )
+        key_html = "".join(rows)
+    else:
+        key_html = "<p class='muted'>אין מפתחות כניסה.</p>"
+    if view["open"]:
+        grant = view.get("grant") or {}
+        when = html.escape(_fmt_time(grant.get("expires_at")))
+        grant_html = f'<p class="ok">גישת תמיכה פתוחה. נסגרת לבד ב-<span dir="ltr">{when}</span>.</p>'
+    else:
+        grant_html = "<p>אין גישת תמיכה.</p>"
+    err = f"<div class='msg'>{html.escape(error)}</div>" if error else ""
+    body = f"""{LOGO['bot']}<h1>מי יכול להיכנס לשרת שלי?</h1>
+<p class="why">כאן רואים מפתחות כניסה, גישת תמיכה, וכניסות אחרונות.</p>
+{err}
+<h2>מפתחות כניסה</h2>
+{key_html}
+<h2>גישת תמיכה</h2>
+{grant_html}
+<h2>כניסות אחרונות</h2>
+{_login_html(view["logins"])}
+<a class="btn sec" href="/status">חזרה</a>"""
+    return page("מי יכול להיכנס לשרת שלי?", body)
+
+def view_team(msg="", done=False):
+    if not team_hook_available():
+        return page("לא נמצא", "<p>לא נמצא</p>")
+    if done:
+        msg = msg or "נשלח. רק המשפט הזה."
+    return page("בקשה לצוות", team_block(msg) + '<a class="btn sec" href="/status">חזרה</a>')
 
 # ---------------- HTTP ----------------
 class H(BaseHTTPRequestHandler):
@@ -434,6 +903,11 @@ class H(BaseHTTPRequestHandler):
             except Exception: return self.send(404, b"", "image/png")
         if p == "/guide/google": return self.send(200, page("מדריך Google", video_block("google") + GUIDE))
         if p == "/google/start": return self.redirect("/step/google")
+        if p == "/support": return self.send(200, view_support())
+        if p == "/who": return self.send(200, view_who())
+        if p == "/team":
+            if not team_hook_available(): return self.send(404, page("לא נמצא", "<p>לא נמצא</p>"))
+            return self.send(200, view_team())
         views = {"/step/identity": view_identity, "/step/whatsapp": view_whatsapp, "/step/openai": view_openai,
                  "/step/google": view_google, "/step/done": view_done, "/status": view_done}
         if p in views: return self.send(200, views[p](st))
@@ -497,6 +971,26 @@ class H(BaseHTTPRequestHandler):
             try: bridge("/logout", {}, timeout=15)
             except Exception: pass
             return self.redirect("/step/whatsapp")
+        if p == "/support/open":
+            result = open_support(f.get("hours"))
+            if not result.get("ok") and result.get("error") == "hours":
+                return self.send(200, view_support(error="אפשר לבחור רק 1, 4, 24 או 72."))
+            return self.redirect("/support")
+        if p == "/support/close":
+            close_support()
+            return self.redirect("/support")
+        if p == "/who/delete":
+            result = delete_ssh_key(f.get("fingerprint") or "")
+            if not result.get("ok"):
+                return self.send(200, view_who(error="לא מחקתי את המפתח."))
+            return self.redirect("/who")
+        if p == "/team/request":
+            if not team_hook_available():
+                return self.send(404, "not found", "text/plain")
+            result = submit_team_request(f.get("summary"), f.get("consent"))
+            if result.get("ok"):
+                return self.send(200, view_team(done=True))
+            return self.send(200, view_team(msg=result.get("error") or "לא נשלח."))
         return self.send(404, "not found", "text/plain")
 
 def ensure_token():
@@ -504,7 +998,19 @@ def ensure_token():
         fd = os.open(TOKEN_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as fh: fh.write(secrets.token_urlsafe(24))
 
-if __name__ == "__main__":
+def main(argv=None):
+    args = list(sys.argv[1:] if argv is None else argv)
+    if args[:1] == ["support-login"]:
+        entry = record_support_login(agent_home())
+        print(entry.get("result") or "denied")
+        return 0
+    if args:
+        print("usage: setup_web.py [support-login]", file=sys.stderr)
+        return 2
     ensure_token()
     print(f"[setup] listening on 127.0.0.1:{PORT}", flush=True)
     ThreadingHTTPServer(("127.0.0.1", PORT), H).serve_forever()
+    return 0
+
+if __name__ == "__main__":
+    raise SystemExit(main())

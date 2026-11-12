@@ -1,6 +1,9 @@
-# Add to /etc/caddy/Caddyfile (after creating a DNS A record for the host -> this server's IP), then (Caddy runs in Docker here): docker exec n8n-setup-caddy-1 caddy validate --config /etc/caddy/Caddyfile && docker exec n8n-setup-caddy-1 caddy reload --config /etc/caddy/Caddyfile
+# Add this block to the Caddyfile after the DNS A record exists, then validate and reload Caddy.
+# If Caddy runs in a container, set CADDY_CONTAINER (example: caddy):
+#   docker exec "$CADDY_CONTAINER" caddy validate --config /etc/caddy/Caddyfile
+#   docker exec "$CADDY_CONTAINER" caddy reload --config /etc/caddy/Caddyfile
+# Upstream is ONBOARD_BIND:ONBOARD_PORT. Example values live in agent-onboarding.service.
 __ONBOARD_HOST__ {
 	encode gzip
-	# 192.0.2.1 is a documentation placeholder. Use the docker bridge address.
-	reverse_proxy 192.0.2.1:8840
+	reverse_proxy __ONBOARD_BIND__:__ONBOARD_PORT__
 }

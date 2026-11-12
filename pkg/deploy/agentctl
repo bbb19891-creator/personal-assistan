@@ -1,13 +1,43 @@
 #!/bin/bash
 # agentctl: small helper for the assistant server
-set -e
+set -euo pipefail
 H=/opt/agent
-case "$1" in
-  link)    echo "https://$(cat $H/.public_host)/?t=$(cat $H/.setup_token)";;
-  new-link) umask 077; head -c 32 /dev/urandom | base64 | tr -dc 'A-Za-z0-9' | head -c 32 > $H/.setup_token; systemctl restart assistant-setup; "$0" link;;
-  status)  for s in assistant-bridge assistant-setup assistant-bot caddy; do printf "%-14s %s\n" "$s" "$(systemctl is-active $s)"; done;;
-  logs)    tail -n ${2:-80} $H/logs/${3:-bot}.log;;
-  restart) systemctl restart assistant-bridge assistant-setup; systemctl restart assistant-bot || true;;
-  update)  echo "Extract a newer package and run its install.sh — data/.env/auth are kept.";;
-  *) echo "usage: agentctl link|new-link|status|logs [N] [bot|bridge|setup]|restart";;
+case "${1:-}" in
+  link)
+    echo "https://$(cat "$H/.public_host")/?t=$(cat "$H/.setup_token")"
+    ;;
+  new-link)
+    umask 077
+    raw="$(head -c 64 /dev/urandom | base64 | tr -dc 'A-Za-z0-9')"
+    printf '%s\n' "${raw:0:32}" > "$H/.setup_token"
+    systemctl restart assistant-setup
+    "$0" link
+    ;;
+  status)
+    for s in assistant-bridge assistant-setup assistant-bot caddy; do
+      printf '%-14s %s\n' "$s" "$(systemctl is-active "$s" || true)"
+    done
+    ;;
+  logs)
+    n="${2:-80}"
+    name="${3:-bot}"
+    case "$name" in
+      bot|bridge|setup) ;;
+      *) echo "unknown log" >&2; exit 1 ;;
+    esac
+    case "$n" in
+      ''|*[!0-9]*) echo "log length must be a number" >&2; exit 1 ;;
+    esac
+    tail -n "$n" "$H/logs/${name}.log"
+    ;;
+  restart)
+    systemctl restart assistant-bridge assistant-setup
+    systemctl restart assistant-bot || true
+    ;;
+  update)
+    echo "Extract a newer package and run its install.sh. data, .env, and auth are kept."
+    ;;
+  *)
+    echo "usage: agentctl link|new-link|status|logs [N] [bot|bridge|setup]|restart|update"
+    ;;
 esac
