@@ -1,0 +1,29 @@
+[Unit]
+Description=Central onboarding site for new assistant owners
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/agent-onboarding
+Environment=PYTHONUNBUFFERED=1
+# PORT: 8840, NOT 8791 (8791/8792 = Tokyo APIs behind Caddy). BIND is a documentation placeholder; set ONBOARD_BIND to the docker bridge so Caddy-in-Docker can reach it; never 0.0.0.0.
+Environment=ONBOARD_PORT=8840
+Environment=ONBOARD_BIND=192.0.2.1
+Environment=ONBOARD_PUBLIC_URL=https://__ONBOARD_HOST__
+ExecStart=/usr/bin/python3 /opt/agent-onboarding/onboard.py
+Restart=always
+RestartSec=3
+User=assistant-onboard
+Group=assistant-onboard
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+NoNewPrivileges=yes
+# may only drop new-bot requests; bots are created by root (assistant-provision.path -> agentsctl)
+ReadWritePaths=/var/lib/assistant-onboarding/requests
+MemoryMax=150M
+StandardOutput=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,18 @@
+[Unit]
+Description=Assistant setup & connections page (127.0.0.1:8790, published by Caddy over HTTPS)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/agent
+Environment=AGENT_HOME=/opt/agent
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/agent/venv/bin/python /opt/agent/setup_web.py
+Restart=always
+RestartSec=3
+StandardOutput=append:/opt/agent/logs/setup.log
+StandardError=append:/opt/agent/logs/setup.log
+
+[Install]
+WantedBy=multi-user.target

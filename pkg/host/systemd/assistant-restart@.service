@@ -1,0 +1,7 @@
+[Unit]
+Description=Assistant bot %i - (re)start the brain after setup changes
+
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl enable assistant-bot@%i.service
+ExecStart=/bin/systemctl restart assistant-bot@%i.service

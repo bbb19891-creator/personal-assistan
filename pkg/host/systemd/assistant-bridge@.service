@@ -1,0 +1,33 @@
+[Unit]
+Description=Assistant bot %i - WhatsApp bridge
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=agent-%i
+Group=agent-%i
+WorkingDirectory=/opt/agents/%i/wa-bridge
+EnvironmentFile=/opt/agents/%i/wa-bridge/.env
+Environment=WA_BASE=/opt/agents/%i/wa-bridge
+ExecStart=/usr/bin/node /opt/agents/_shared/wa-bridge/bridge.mjs
+Restart=always
+RestartSec=10
+MemoryMax=400M
+CPUQuota=50%
+TasksMax=200
+StandardOutput=append:/opt/agents/%i/logs/bridge.log
+StandardError=append:/opt/agents/%i/logs/bridge.log
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ReadWritePaths=/opt/agents/%i
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+UMask=0077
+
+[Install]
+WantedBy=multi-user.target

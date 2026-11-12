@@ -1,0 +1,6 @@
+[Unit]
+Description=Assistant bots - write health files (no content) to /opt/agents/_status
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/agentsctl status --write

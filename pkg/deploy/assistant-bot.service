@@ -1,0 +1,22 @@
+[Unit]
+Description=Personal WhatsApp assistant (agent)
+After=network-online.target assistant-bridge.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/agent
+Environment=AGENT_HOME=/opt/agent
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/agent/venv/bin/python /opt/agent/run.py
+Restart=on-failure
+RestartSec=5
+# exit 3 = not configured yet -> wait for the setup page to start it
+RestartPreventExitStatus=3
+StandardOutput=append:/opt/agent/logs/bot.log
+StandardError=append:/opt/agent/logs/bot.log
+MemoryMax=1G
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

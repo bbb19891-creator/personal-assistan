@@ -1,0 +1,9 @@
+[Unit]
+Description=Assistant bots - new-bot requests from the onboarding site
+
+[Path]
+DirectoryNotEmpty=/var/lib/assistant-onboarding/requests
+Unit=assistant-provision.service
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,7 @@
+#cloud-config
+# Manual path (without the central setup site): paste this into Hetzner Cloud > Create server > "Cloud config".
+# Replace __PKG_URL__ with the package download link and __SETUP_TOKEN__ with a long random secret of your own
+# (letters/digits, 24+ chars). After ~5 minutes open: https://<SERVER-IP-with-dashes>.sslip.io/?t=__SETUP_TOKEN__
+package_update: true
+runcmd:
+  - [bash, -c, "set -e; curl -fsSL '__PKG_URL__' -o /root/agent.tar.gz; mkdir -p /root/agent-src; tar xzf /root/agent.tar.gz -C /root/agent-src; bash /root/agent-src/install.sh --yes --setup-token '__SETUP_TOKEN__' > /root/agent-install.log 2>&1"]
