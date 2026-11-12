@@ -8,6 +8,7 @@ User=agent-%i
 Group=agent-%i
 WorkingDirectory=/opt/agents/%i
 Environment=AGENT_HOME=/opt/agents/%i
+Environment=HOME=/opt/agents/%i
 Environment=AGENT_TENANT=%i
 Environment=PYTHONUNBUFFERED=1
 ExecStart=/opt/agents/_shared/venv/bin/python /opt/agents/_shared/agent/run.py

@@ -6,6 +6,7 @@ import os, re, sys, time, runpy
 CODE = os.path.dirname(os.path.abspath(__file__))          # shared code dir (single install: same as HOME)
 HOME = os.environ.get("AGENT_HOME") or CODE                 # this bot's own dir: .env, data/, logs/, wa-bridge/
 os.environ["AGENT_HOME"] = HOME
+os.environ["AGENT_CODE"] = CODE
 
 def load_env(path):
     if not os.path.exists(path): return
@@ -25,10 +26,24 @@ def clean_tz(v):
     v = str(v or "").strip()
     return v if re.fullmatch(r"[A-Za-z_]+(?:/[A-Za-z_+\-0-9]+){0,2}", v) else "Asia/Jerusalem"
 
+def required_keys(home=None):
+    """Identity is always required. After release the OpenAI key may be absent."""
+    keys = ["OPENAI_API_KEY", "BOT_NAME", "OWNER_NAME", "OWNER_PHONE"]
+    home = home or HOME
+    try:
+        if CODE not in sys.path:
+            sys.path.insert(0, CODE)
+        from release_runtime import allows_missing_openai_key
+        if allows_missing_openai_key(home):
+            keys = [k for k in keys if k != "OPENAI_API_KEY"]
+    except Exception:
+        pass
+    return keys
+
 def main():
     os.umask(0o077)   # db, tokens and logs readable by root only
     load_env(os.path.join(HOME, ".env"))
-    missing = [k for k in ("OPENAI_API_KEY", "BOT_NAME", "OWNER_NAME", "OWNER_PHONE") if not os.environ.get(k)]
+    missing = [k for k in required_keys(HOME) if not os.environ.get(k)]
     if missing:
         print(f"[SETUP] not configured yet, missing: {', '.join(missing)} — open the setup page", flush=True)
         sys.exit(3)

@@ -46,6 +46,8 @@ DOC_NETS = (
 )
 LOOPBACK = ipaddress.ip_address("127.0.0.1")
 UNSPECIFIED = ipaddress.ip_address("0.0.0.0")
+# Documentation example of the docker bridge gateway. Not a live server address.
+DOCKER_BRIDGE_EXAMPLE = ipaddress.ip_address("172.17.0.1")
 
 
 def denylist_path() -> Path:
@@ -77,7 +79,7 @@ def ip_allowed(text: str) -> bool:
         ip = ipaddress.ip_address(text)
     except ValueError:
         return True
-    if ip in (LOOPBACK, UNSPECIFIED):
+    if ip in (LOOPBACK, UNSPECIFIED, DOCKER_BRIDGE_EXAMPLE):
         return True
     return any(ip in net for net in DOC_NETS)
 

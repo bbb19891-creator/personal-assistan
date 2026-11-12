@@ -1,0 +1,21 @@
+[Unit]
+Description=Assistant manager
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /usr/local/lib/assistant-manager/assistant_manager.py serve
+Environment=AM_DATA=/var/lib/assistant-manager
+Environment=AM_AGENTS_ROOT=/opt/agents
+Environment=AM_BIND_LOCAL=127.0.0.1
+Environment=AM_BIND_PROXY=127.0.0.1
+Environment=AM_PORT=8850
+Environment=AM_PREFIX=/manage
+Environment=AM_PUBLIC_ORIGIN=https://start.bbbai.online
+EnvironmentFile=-/etc/assistant-manager/wa.manager.env
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
