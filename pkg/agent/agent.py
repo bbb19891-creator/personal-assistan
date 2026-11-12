@@ -2917,11 +2917,18 @@ def reminder_loop():
                 (now_iso,)).fetchall()
             for rid, chat_id, content, fire_at, recurrence in rows:
                 try:
+                    _rtxt, _rplain = (globals()["_reminder_text"](rid, chat_id, content) if callable(globals().get("_reminder_text"))
+                                      else (f"⏰ תזכורת #{rid}: {content}\n\n_להגיב 'דחה 10 דק' / 'בטל'_", False))
                     if str(chat_id).startswith("wa:"):
-                        globals()["_wa_api"]("/send/text", {"chat_id": str(chat_id)[3:], "text": f"⏰ תזכורת #{rid}: {content}\n\n_להגיב 'דחה 10 דק' / 'בטל'_"})
+                        globals()["_wa_api"]("/send/text", {"chat_id": str(chat_id)[3:], "text": _rtxt})
+                    elif _rplain:
+                        bot.send_message(chat_id, _rtxt)
                     else:
-                        bot.send_message(chat_id, f"⏰ תזכורת #{rid}: {content}\n\n_להגיב 'דחה 10 דק' / 'בטל'_", parse_mode="Markdown")
+                        bot.send_message(chat_id, _rtxt, parse_mode="Markdown")
                     print(f"[REMIND] fired #{rid} → chat {chat_id}", flush=True)
+                    try:  # the chat must know what was just sent (a later 'בטל' refers to THIS reminder)
+                        save_message(chat_id, "assistant", _rtxt)
+                    except Exception as _se: print(f"[REMIND] history save failed #{rid}: {type(_se).__name__}", flush=True)
                 except Exception as send_err:
                     print(f"[REMIND] send failed #{rid}: {send_err}", flush=True)
                 # Advance or close
@@ -3602,7 +3609,8 @@ def _wa_process_inner(p):
     if not _wa_is_allowed(p):
         print(f"[WA-REJECT] chat={jid} sender={p.get('sender')} phone={p.get('sender_pn')} name={p.get('sender_name')}", flush=True)
         if not is_group and not _wa_is_blocked(p) : _wa_alert_unknown(p)
-    if cfg and cfg["role"].startswith("kid:") and (_wa_is_owner(p) or (WA_PARTNER_PHONE and WA_PARTNER_PHONE in _wa_idents(p))):
+    if cfg and cfg["role"].startswith("kid:") and (_wa_is_owner(p) or (WA_PARTNER_PHONE and WA_PARTNER_PHONE in _wa_idents(p))) \
+            and _family_owner_person(p) != cfg["role"].split(":", 1)[1]:
         # parents in a kid's group: normal adult assistant, own memory, answer only when addressed
         if p.get("type") == "text" and (p.get("text") or "").strip():
             _rk = cfg["role"].split(":", 1)[1]
@@ -3635,7 +3643,8 @@ def _wa_process_inner(p):
         _kv_set("partner_last_msg", datetime.now().isoformat())
         ou = _kv_get("fam_q_open_until"); q_open = bool(ou) and datetime.now().isoformat() < ou
     _fam = bool(WA_FAMILY_GROUP) and jid == WA_FAMILY_GROUP and not is_self
-    addressed = (lambda t: True) if (respond_all or q_open) else (lambda t: _wa_addressed(p, t) or (_fam and globals().get("_coach_fam_workout") is not None and _coach_fam_workout(p, t)) or (_fam and bool((t or '').strip()) and _wa_llm_addressed(key, t, sender)))
+    _kidgrp = bool(cfg and str(cfg["role"] or "").startswith("kid:")) and not is_self
+    addressed = (lambda t: True) if (respond_all or q_open) else (lambda t: _wa_addressed(p, t) or (_fam and globals().get("_coach_fam_workout") is not None and _coach_fam_workout(p, t)) or ((_fam or _kidgrp) and bool((t or '').strip()) and _wa_llm_addressed(key, t, sender)))
     print(f"[WA {key}] {datetime.now().strftime('%H:%M:%S')} {mtype} ({'self' if is_self else (cfg['name'] if cfg else ('group' if is_group else 'pm'))}, {sender}): {_owner_safe_log(text)[:200]}", flush=True)
 
     if mtype in ("voice", "audio"):
@@ -3695,7 +3704,7 @@ def _wa_process_inner(p):
     if tag_reply is not None:
         save_message(key, "user", effective); save_message(key, "assistant", tag_reply)
         wbot.reply_to(msg, tag_reply); return
-    _wa_run_agent(key, effective, wbot, msg, eff_group, limit=6)
+    _wa_run_agent(key, effective, wbot, msg, eff_group, limit=12)
 def _wa_startup_group_scan():
     for _ in range(30):
         if _wa_connected(): break
@@ -5847,6 +5856,171 @@ try:
 except Exception as _e:
     print(f"[RELEASE] init failed: {type(_e).__name__}", flush=True)
 # ============ END RELEASE ============
+
+# ============ CONTEXT & LOGIC FIXES (ported from the 2026-11-12 audit) ============
+# Generic fixes only (no personal data). Root causes seen in production:
+#  (a) a pending 'save to library?' question captured unrelated short replies ('כן' to a different question);
+#  (b) history kept only final text, so the model later denied actions its own tools had performed;
+#  (c) a reminder used as a scheduled report sent its raw instruction text to the group;
+#  (d) failed-charge notices ('payment failed', 'לא הצלחנו לחייב') were stored as bills and raised 'new subscription' alerts;
+#  (e) a kid who is also listed as an owner was treated as a parent inside the kid's own group.
+import threading as _c12_th
+
+# ---- (a) pending doc: the deterministic shortcut only when the save question is the very last chat message ----
+_orig_handle_pending_doc_reply_c12 = _handle_pending_doc_reply
+def _handle_pending_doc_reply(user_id, user_text):
+    try:
+        row = conn.execute("SELECT id FROM pending_docs WHERE chat_id=? AND status='pending' AND created_at>=? ORDER BY id DESC LIMIT 1",
+                           (str(user_id), (datetime.now() - timedelta(days=3)).isoformat())).fetchone()
+        if not row: return None
+        last = conn.execute("SELECT role, content FROM conversations WHERE user_id=? ORDER BY id DESC LIMIT 1", (user_id,)).fetchone()
+        if not (last and last[0] == "assistant" and "לשמור בספרייה" in (last[1] or "")):
+            print(f"[DOC-C12] pending #{row[0]}: last chat message is not the save question -> main agent decides", flush=True)
+            return None
+    except Exception as e:
+        print(f"[DOC-C12] guard error: {type(e).__name__}", flush=True); return None
+    return _orig_handle_pending_doc_reply_c12(user_id, user_text)
+
+def tool_pending_doc(action, title="", tags=""):
+    """Resolve the latest document waiting for 'save to library?' approval in this chat (owners only)."""
+    if not _requester_is_owner(): return _OWNER_ONLY
+    key = _current_chat_id_ref[0] if _current_chat_id_ref else 0
+    row = conn.execute("SELECT id, title, tags, filename FROM pending_docs WHERE chat_id=? AND status='pending' AND created_at>=? ORDER BY id DESC LIMIT 1",
+                       (str(key), (datetime.now() - timedelta(days=3)).isoformat())).fetchone()
+    if not row: return "אין מסמך שממתין לאישור שמירה בצ'אט הזה."
+    rid, t0, g0, fn = row
+    a = (action or "").strip().lower()
+    if a == "status": return f"ממתין לאישור: «{t0}» ({fn}), תגיות: {g0}"
+    if a == "discard":
+        conn.execute("UPDATE pending_docs SET status='discarded' WHERE id=?", (rid,)); conn.commit()
+        return f"👍 לא שמרתי את «{t0}»."
+    if a == "save":
+        return _commit_pending_doc(rid, (title or t0).strip()[:120], (tags or g0).strip()[:200])
+    return "action must be save / discard / status"
+TOOLS.append({"type": "function", "function": {"name": "tool_pending_doc", "description":
+    "Resolve the document waiting for 'לשמור בספרייה?' approval in THIS chat. Use when the owner refers to that pending file "
+    "(e.g. 'תשמור את החוזה', 'לא צריך לשמור אותו') even if other messages came in between. "
+    "Never use it for a short reply ('כן', 'קצר יותר') that answers a DIFFERENT, more recent question.",
+    "parameters": {"type": "object", "properties": {
+        "action": {"type": "string", "enum": ["save", "discard", "status"]},
+        "title": {"type": "string", "description": "final title if the owner gave one"},
+        "tags": {"type": "string", "description": "final tags if the owner gave them"}}, "required": ["action"]}}})
+TOOL_FUNCTIONS["tool_pending_doc"] = tool_pending_doc
+
+_orig_build_state_block_c12 = _build_state_block
+def _build_state_block(chat_id, is_group=False, current_speaker=None):
+    out = _orig_build_state_block_c12(chat_id, is_group=is_group, current_speaker=current_speaker)
+    try:
+        if str(chat_id).startswith("kid:"): return out
+        r = conn.execute("SELECT title, filename, created_at FROM pending_docs WHERE chat_id=? AND status='pending' AND created_at>=? ORDER BY id DESC LIMIT 1",
+                         (str(chat_id), (datetime.now() - timedelta(days=3)).isoformat())).fetchone()
+        if r:
+            out += (f"\n=== מסמך ממתין לאישור שמירה ===\n«{r[0]}» ({r[1]}), נשלח {str(r[2])[:16].replace('T', ' ')}. "
+                    "אם ההודעה הנוכחית מתייחסת אליו — tool_pending_doc. 'כן'/'לא'/'קצר יותר' שעונים על שאלה אחרת ומאוחרת יותר — אינם על המסמך.\n")
+    except Exception as e: print(f"[DOC-C12] state hint: {type(e).__name__}", flush=True)
+    return out
+
+# ---- (b) tool trace: each stored assistant turn carries a compact list of the tools that really ran ----
+_c12_tls = _c12_th.local()
+_C12_TRACE_RX = _fre.compile(r"\n?⟦כלים[^⟧]*⟧")
+def _c12_add(name, ok, res):
+    items = getattr(_c12_tls, "items", None)
+    if items is None: return
+    if _VBC_WRITE.search(name) or "pending_doc" in name:
+        snip = _fre.sub(r"\s+", " ", str(res or ""))[:90]
+        items.append(f"{name} {'✅' if ok else '❌'} {snip}".strip())
+    else:
+        items.append(f"{name} {'✅' if ok else '❌'}")
+class _C12Dict(type(TOOL_FUNCTIONS)):
+    def get(self, k, d=None):
+        f = super().get(k, d)
+        if not callable(f): return f
+        def w(*a, **kw):
+            try: r = f(*a, **kw)
+            except Exception as e:
+                _c12_add(k, False, f"error {type(e).__name__}"); raise
+            _c12_add(k, not str(r).startswith(("❌", "⛔", "Tool error", "ERROR", "Unknown tool")), r)
+            return r
+        return w
+TOOL_FUNCTIONS = _C12Dict(TOOL_FUNCTIONS)
+
+_orig_save_message_c12 = save_message
+def save_message(user_id, role, content):
+    try:
+        if role == "assistant" and getattr(_c12_tls, "key", None) == str(user_id) and getattr(_c12_tls, "items", None):
+            content = (content or "") + "\n⟦כלים בתור הזה: " + " | ".join(_c12_tls.items[-8:])[:700] + "⟧"
+            _c12_tls.items = []
+    except Exception: pass
+    return _orig_save_message_c12(user_id, role, content)
+
+SYSTEM_PROMPT += ("\n=== רישום כלים בהיסטוריה ===\n"
+    "- בסוף הודעות קודמות שלך מופיעה לפעמים שורה ⟦כלים בתור הזה: …⟧ — רישום פנימי של הכלים שבאמת רצו באותו תור. "
+    "סמוך עליה: אם כתוב שם tool_create_reminder ✅ — התזכורת נוצרה. לעולם אל תכתוב שלא ביצעת פעולה קודמת בלי לבדוק את השורה הזו / "
+    "tool_search_chat_history / רשימת התזכורות. אל תעתיק את השורה הזו לתשובה.\n"
+    "- הודעה שמתחילה ב״⏰ תזכורת #N״ היא תזכורת שנשלחה עכשיו. ״בטל״/״דחה״ מיד אחריה מתייחס לתזכורת הזו או לאירוע שלה, לא לשום דבר אחר.\n"
+    "- תשובה קצרה (״כן״, ״לא״, ״קצר יותר״, ״בטל״) עונה לשאלה/לטיוטה האחרונה שלך, לא לשאלה ישנה יותר. אם לא ברור — שאלה אחת קצרה.\n"
+    "- תוכן תזכורת נשלח כמו שהוא. לעולם אל תכתוב בתוכן תזכורת הוראות לעצמך (שמות כלים, ״בדוק ב-web_search״). "
+    "לדוח בוקר יומי לקבוצת המשפחה (מזג אוויר + חוגים) כתוב בתוכן בדיוק: ״דוח בוקר לקבוצת המשפחה״ — המערכת מפיקה דוח אמיתי בזמן השליחה.\n"
+    "- הפתעה/מתנה/בילוי שבעלים מתכנן עבור בן/בת הזוג או מישהו אחר — מזכירים רק לבעלים בפרטי. לא מזכירים אותה בקבוצה שבה הוא נמצא ולא מולו, "
+    "גם כשמבקשים ״לעדכן אותו/ה על התוכניות״. אם לא ברור — לשאול את הבעלים בפרטי.\n"
+    "- כשמעבירים או מסכמים הודעה של מישהו אחר (ילד, בן משפחה) — רק מה שכתוב בה. הודעה לא ברורה מעבירים כ״הודעה לא ברורה״ עם הציטוט, בלי לנחש תוכן "
+    "(למשל לא להפוך הודעה משובשת ל״לא מרגיש טוב״).\n"
+    "- מייל ״החיוב נכשל / לא הצלחנו לחייב / payment failed״ אינו חשבונית ואינו הוצאה; זו התראה שכדאי לעדכן אמצעי תשלום.\n")
+
+_orig_handle_with_tools_c12 = handle_with_tools
+def handle_with_tools(user_id, user_text, context_rows, bot, message):
+    _c12_tls.key = str(user_id); _c12_tls.items = []
+    out = _orig_handle_with_tools_c12(user_id, user_text, context_rows, bot, message)
+    try:
+        if isinstance(out, str) and "⟦" in out: out = _C12_TRACE_RX.sub("", out).rstrip()
+    except Exception: pass
+    return out
+
+# ---- (c) reminder rendering: a 'family morning report' reminder is generated at send time ----
+_FAM_REPORT_PREFIX = "דוח בוקר לקבוצת המשפחה"
+_REM_INSTR_RX = _fre.compile(r"\bweb_search\b|\btool_[a-z_]+")
+def _family_daily_report(day=None):
+    day = day or _fam_today()
+    city = _weather_city()
+    wl = "אין נתון מאומת"
+    try:
+        raw = str(web_search(f"תחזית מזג האוויר ל{city} היום {day.strftime('%d/%m/%Y')}: טמפרטורה מקסימלית ומינימלית, גשם, רוח"))[:1500]
+        got = (_fam_llm(f"סכם בשורה אחת קצרה בעברית את תחזית מזג האוויר ל{city} להיום {day.strftime('%d.%m.%Y')}: טווח טמפרטורות, גשם, "
+                        f"והמלצה קצרה (מעיל/מטריה) אם רלוונטי. השתמש רק במה שכתוב בטקסט. אם אין בו תחזית ברורה להיום — החזר בדיוק: אין נתון מאומת.\n\n{raw}",
+                        model=CHEAP_MODEL, max_tokens=120) or "").strip()
+        if got: wl = got.splitlines()[0][:200]
+    except Exception as e: print(f"[FAM-REPORT] weather failed: {type(e).__name__}", flush=True)
+    acts = _activities_on(day)
+    lines = [f"בוקר טוב משפחה ☀️ יום {_WD[(day.weekday() + 1) % 7]}, {day.strftime('%d.%m')}", f"🌤️ מזג האוויר ב{city}: {wl}"]
+    if acts:
+        lines.append("🗓️ חוגים היום:")
+        lines += [f"• {st}{('–' + en) if en else ''} {kid} — {name}{(' @ ' + loc) if loc else ''}" for kid, name, st, en, loc in acts]
+    else:
+        lines.append("🗓️ אין חוגים רשומים להיום.")
+    return "\n".join(lines)
+def _reminder_text(rid, chat_id, content):
+    c = str(content or "")
+    if c.startswith(_FAM_REPORT_PREFIX) or ("מזג האוויר" in c and _REM_INSTR_RX.search(c)):
+        try: return _family_daily_report(), True
+        except Exception as e: print(f"[FAM-REPORT] render failed #{rid}: {type(e).__name__}", flush=True)
+    if _REM_INSTR_RX.search(c):   # never show internal tool names to people
+        c = _fre.sub(r"\s{2,}", " ", _REM_INSTR_RX.sub("", c)).strip()
+    return f"⏰ תזכורת #{rid}: {c}\n\n_להגיב 'דחה 10 דק' / 'בטל'_", False
+
+# ---- (d) failed-charge notices are not bills ----
+_FAILED_PAY_RX = _fre.compile(r"payment[^\n]{0,40}unsuccessful|unsuccessful payment|payment declined|card (?:was )?declined|החיוב נדחה|התשלום נדחה|"
+                              r"לא הצלחנו לחייב|החיוב נכשל|התשלום נכשל|couldn.?t process (?:your )?payment|payment (?:has )?failed|failed payment|"
+                              r"unable to (?:process|charge)|update (?:your )?payment method|עדכן את אמצעי התשלום", _fre.I)
+_orig_extract_bill_c12 = _extract_bill
+def _extract_bill(meta):
+    try:
+        if _FAILED_PAY_RX.search(f"{meta.get('subject', '')}\n{meta.get('snippet', '')}"):
+            print("[BILLS] failed-payment notice, not a bill", flush=True)
+            return {"is_bill": False}
+    except Exception: pass
+    return _orig_extract_bill_c12(meta)
+print("[CTX-C12] pending-doc guard + tool_pending_doc, tool trace in history, reminder render/history, failed-payment filter, kid/owner separation", flush=True)
+# ============ END CONTEXT & LOGIC FIXES ============
 
 if os.environ.get("AGENT_DRY_RUN") == "1":
     try:   # offline self-test of owner authorization (no network, no sends)
