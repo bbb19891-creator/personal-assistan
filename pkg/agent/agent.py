@@ -3609,6 +3609,7 @@ def _wa_process_inner(p):
     if not _wa_is_allowed(p):
         print(f"[WA-REJECT] chat={jid} sender={p.get('sender')} phone={p.get('sender_pn')} name={p.get('sender_name')}", flush=True)
         if not is_group and not _wa_is_blocked(p) : _wa_alert_unknown(p)
+        return   # not allowed: alert the owner (above) and stop; never run the agent for this sender
     if cfg and cfg["role"].startswith("kid:") and (_wa_is_owner(p) or (WA_PARTNER_PHONE and WA_PARTNER_PHONE in _wa_idents(p))) \
             and _family_owner_person(p) != cfg["role"].split(":", 1)[1]:
         # parents in a kid's group: normal adult assistant, own memory, answer only when addressed

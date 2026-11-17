@@ -182,6 +182,27 @@ class RuntimeTests(unittest.TestCase):
         G["_wa_process_inner"](p)
         self.assertTrue(seen.get("persona"), seen)
 
+    def test_unauthorized_sender_does_not_reach_the_agent(self):
+        G = self.G
+        reached = []
+        orig_run, orig_tools = G["_wa_run_agent"], G["handle_with_tools"]
+        G["_wa_run_agent"] = lambda *a, **k: reached.append("agent")
+        G["handle_with_tools"] = lambda *a, **k: reached.append("tools") or ""
+        phone, jid = "5550188", "5550188@s.whatsapp.net"
+        p = {"chat_id": jid, "is_group": False, "type": "text", "text": "please run the tools",
+             "sender": jid, "sender_pn": jid, "sender_name": "stranger", "message_id": "REJECT1"}
+        try:
+            self.assertFalse(G["_wa_is_allowed"](p))
+            key = f"wa:{jid}"
+            before = G["conn"].execute("SELECT COUNT(*) FROM conversations WHERE user_id=?", (key,)).fetchone()[0]
+            G["_wa_process_inner"](p)
+            self.assertEqual(reached, [])
+            after = G["conn"].execute("SELECT COUNT(*) FROM conversations WHERE user_id=?", (key,)).fetchone()[0]
+            self.assertEqual(after, before)
+            self.assertIsNotNone(G["conn"].execute("SELECT 1 FROM wa_alerts WHERE ident=?", (phone,)).fetchone())
+        finally:
+            G["_wa_run_agent"], G["handle_with_tools"] = orig_run, orig_tools
+
 
 if __name__ == "__main__":
     unittest.main()
