@@ -9,10 +9,10 @@ main() {
   set -euo pipefail
   exec </dev/null
 
-  PINNED_SHA256="6968674fddeafe183ec988d4af3fb252fc710d7ea888f6c3d331f51fe5323f3b"
+  PINNED_SHA256="29de2d9e2b161a89f4df5c4ab4211e0dfe56ba1de974af435aa36a8d3d2bdfdd"
   OWNER_B64="YmJiMTk4OTEtY3JlYXRvcg=="
   REPO_B64="cGVyc29uYWwtYXNzaXN0YW4="
-  REF_B64="NzZlNmM2MGQ2MzE0MjVlMjViM2VkYjMxNTY5OGU0NDBkYTM1NmYwMg=="
+  REF_B64="MWMwNzE5OTA4MTc0ZDEzYTc2ZWE5MmQ4MDNjMTdhZGFmZmNjN2JiNA=="
 
   refuse_token() {
     printf '%s\n' "refusing: this installer does not accept an API token" >&2
